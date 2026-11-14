@@ -14,11 +14,31 @@ templates in [`mindslice_forge/prompts/`](mindslice_forge/prompts/).
 
 Python 3.12+, standard library only. Needs `mindslice`, `git` and an agent harness on `PATH`.
 
+## When to use Forge
+
+Use Forge when you want an agent to distill source documents into topic cards. MindSlice itself
+handles the other starting points without Forge:
+
+- `mindslice init <workspace>` creates empty memory for learning through conversation.
+- `mindslice -w <workspace> ...` opens an existing workspace directly.
+- `mindslice -w <workspace> mount <directory>` mounts a `.slice` or a plain Markdown notes folder
+  read-only, without LLM conversion.
+
+MindSlice's [setup skill](https://github.com/pancerZH/MindSlice/blob/main/skills/mindslice-setup/SKILL.md)
+guides onboarding; its [builder skill](https://github.com/pancerZH/MindSlice/blob/main/skills/slice-builder/SKILL.md)
+uses Forge for conversion and connects the result. Forge is optional for MindSlice users; the
+engine does not call an LLM or require Forge as a runtime dependency.
+
 ## Install
 
 ```bash
+git clone https://github.com/pancerZH/MindSlice-forge.git
+cd MindSlice-forge
 pipx install -e .        # or: pip install -e . inside a virtual environment
 ```
+
+Reuse an existing checkout or installation when available. Install MindSlice separately and make
+sure the chosen harness is authenticated and its model is available.
 
 ## Use
 
@@ -112,7 +132,7 @@ novel.workspace/            a MindSlice workspace, ready for `mindslice -w novel
 ├── mounts.toml, overlay/, staging/
 ├── slices/<name>.slice/    the cards, mounted
 └── .git/                   one commit per finished chunk: the checkpoints
-novel.workspace.forge/      the forge's own directory; delete it when the build is done
+novel.workspace.forge/      build state and evidence; keep it for resume and review
 ├── state.json              progress
 ├── profile.md, plan.md, split.py, report.md
 ├── chunks/                 the chunk files and manifest.json
@@ -124,12 +144,47 @@ novel.workspace.forge/      the forge's own directory; delete it when the build 
 The forge directory lives next to the workspace so that workspace backups do not carry a copy of
 the sources.
 
+## Connect the result to MindSlice
+
+**For a new workspace**, pass the intended workspace path to Forge with `-o`. Forge initializes
+it and mounts the generated slices; do not run `mindslice init` there first. After checking the
+report, validation and representative facts, use `mindslice -w <output> ...` or connect your
+agent's MCP server to that workspace.
+
+**For an existing workspace**, build into a separate new directory. Forge cannot take over a
+nonempty workspace that it did not create. Inspect the resulting `slices/*.slice` aliases and
+dependencies, then mount the selected individual slices. For example, if the build produced
+`handbook.slice` and its alias is available in your destination:
+
+```bash
+mindslice -w ~/mindslice mount /path/to/build.workspace/slices/handbook.slice \
+  --precedence 50 --role curated
+mindslice -w ~/mindslice validate
+```
+
+Mount each required slice separately, preserving aliases used by cross-slice links. Resolve
+collisions before mounting; do not silently replace an existing mount. The workspace root,
+`slices/` parent and `.forge/` build directory are not slice mount targets.
+
+Keep mounted paths stable. If you plan further Forge rebuilds, first copy the selected slices to
+new durable library directories or the destination's `slices/` directory and mount those copies.
+Otherwise a rebuild or rollback can change the files the live workspace reads. Keep the sibling
+`.forge/` directory for resume and evidence; completed slice artifacts do not depend on it at runtime.
+
+Validation checks structure, and recorded lookups check search coverage. Neither establishes that
+the model preserved every fact. Treat input coverage, retrieval and source fidelity as separate
+checks; a sampled build remains partial after it is connected to an agent.
+
 ## Safety
 
+- Select allowed sources before invoking Forge, including `--dry-run`: recursive scanning does
+  not honor project ignore files or forbidden-directory markers. Pass selected files or prepare
+  an allowed snapshot with exclusions applied before traversal. Keep output, reference files and
+  conversion prompts outside the source directories.
 - The agent runs with tool permissions approved automatically, and the splitter is a program the
   agent wrote. Convert sources you trust, or run the forge in a sandbox.
-- The forge only creates its output directory, and never takes over one that already exists.
-  Rollbacks happen inside that directory only.
+- Forge writes its output workspace and sibling `.forge/` directory. It refuses to take over an
+  existing nonempty output it did not create. Workspace rollbacks happen inside its output directory.
 
 ## Tests
 
