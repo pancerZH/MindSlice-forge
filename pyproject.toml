@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mindslice-forge"
+version = "0.1.0"
+description = "Turn documents into a MindSlice workspace by driving an agent harness (Python stdlib only)."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "pancerZH" }]
+requires-python = ">=3.12"
+dependencies = []
+keywords = ["llm", "agents", "memory", "markdown", "mindslice"]
+
+[project.scripts]
+mindslice-forge = "mindslice_forge.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mindslice_forge"]
+
+[tool.setuptools.package-data]
+mindslice_forge = ["prompts/*.md"]
