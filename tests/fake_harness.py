@@ -10,6 +10,9 @@ on request through the ``FAKE_MODES`` environment variable (comma-separated):
     fail_once    the first session for chunk 0002 leaves a junk file and exits with status 1
     fail_always  every extract session exits with status 1
     no_lookup    extract sessions create cards without looking their names up first
+    fail_after_lookup  chunk 0002 looks up a name then fails; its retry omits the lookup
+    finalize_card     finalize creates a card without a lookup
+    repair_new_card   the first extract repair creates another card without a lookup
 
 Every session is recorded in ``<forge dir>/fake-calls.log``.
 """
@@ -110,12 +113,16 @@ def plan() -> None:
 
 
 def extract(ident: str, earlier_calls: int) -> None:
+    if "fail_after_lookup" in MODES and ident == "0002" and earlier_calls == 0:
+        look_up("Hero")
+        card("story/junk", "Hero", "Left by a failed attempt.")
+        sys.exit(1)
     if "fail_always" in MODES or ("fail_once" in MODES and ident == "0002" and earlier_calls == 0):
         (SLICE / "junk.md").write_text("left behind by a failed session\n", encoding="utf-8")
         sys.exit(1)
     text = (WORK / "chunks" / f"{ident}.txt").read_text(encoding="utf-8")
     content = next(line for line in text.splitlines() if line.strip() and not line.startswith("====="))
-    if "no_lookup" not in MODES:
+    if "no_lookup" not in MODES and not ("fail_after_lookup" in MODES and ident == "0002"):
         for name in ("Hero", "Broken", "Bare"):
             look_up(name)
     if ident == "0001":
@@ -135,13 +142,22 @@ def repair(step: str) -> None:
     if step == "split":
         (WORK / "split.py").write_text(SPLITTER % {"gap": False}, encoding="utf-8")
     if step.startswith("extract-"):
-        look_up("the Hero of the story")
+        look_up("Hero")
+        if "repair_new_card" in MODES:
+            if STEP.endswith("repair1"):
+                card("story/repair-note", "Repair note", "A fact preserved during repair.")
+            else:
+                look_up("Repair note")
     if step == "extract-0001":
         (SLICE / "story" / "broken.md").unlink(missing_ok=True)
         (SLICE / "story" / "bare.md").unlink(missing_ok=True)
+    if step == "finalize" and "finalize_card" in MODES:
+        look_up("Glossary")
 
 
 def finalize() -> None:
+    if "finalize_card" in MODES:
+        card("story/glossary", "Glossary", "Names used by the story.")
     (SLICE / "overview.md").write_text("# Demo\n\nStart with [[story/hero]].\n", encoding="utf-8")
     (WORK / "report.md").write_text("# Report\n", encoding="utf-8")
 

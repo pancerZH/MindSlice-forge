@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from mindslice_forge import cli, harness
+from mindslice_forge import checkpoint, cli, harness, pipeline
 
 FAKE = f"{sys.executable} {Path(__file__).with_name('fake_harness.py')} {{prompt_file}}"
 
@@ -223,6 +223,27 @@ class FunctionalTest(unittest.TestCase):
         self.assertIn("problems remain after 2 repair session(s)", err)
         self.assertEqual(self.state()["chunks_done"], [])
 
+    def test_failed_attempt_lookups_do_not_cover_the_retry(self):
+        code, _, err = self.forge(*NOVEL_ARGS, "--sample", "2", modes="fail_after_lookup")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls(), ["plan", "extract-0001", "extract-0002", "extract-0002",
+                                        "extract-0002.repair1", "finalize"])
+        self.assertIn("not_looked_up", self.prompt("extract-0002.repair1"))
+        self.assertFalse((self.out / "slices/demo.slice/story/junk.md").exists())
+
+    def test_cards_created_during_repair_also_need_lookups(self):
+        code, _, err = self.forge("--sample", "1", modes="no_lookup,repair_new_card")
+        self.assertEqual(code, 0, err)
+        self.assertIn("story/repair-note.md", self.prompt("extract-0001.repair2"))
+        self.assertIn("not_looked_up", self.prompt("extract-0001.repair2"))
+
+    def test_finalization_cannot_create_cards_without_lookups(self):
+        code, _, err = self.forge("--sample", "1", modes="finalize_card")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls()[-2:], ["finalize", "finalize.repair1"])
+        self.assertIn("story/glossary.md", self.prompt("finalize.repair1"))
+        self.assertIn("lookup.py", self.prompt("finalize"))
+
     def test_validation_error_triggers_a_repair_session(self):
         code, _, err = self.forge(*NOVEL_ARGS, "--sample", "1", modes="bad_card")
         self.assertEqual(code, 0, err)
@@ -346,6 +367,44 @@ class FunctionalTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
             self.assertEqual(cli.main(argv), 1)
         self.assertIn("harness command not found: no-such-harness-command", stderr.getvalue())
+
+
+@unittest.skipUnless(shutil.which("git"), "needs git")
+class LookupCheckpointTest(unittest.TestCase):
+    def test_new_cards_include_staged_and_renamed_files_but_not_existing_edits(self):
+        with tempfile.TemporaryDirectory(prefix="forge-checkpoint-") as directory:
+            out = Path(directory).resolve()
+            root = out / "slices/demo.slice"
+            root.mkdir(parents=True)
+
+            def card(name, title, aliases=()):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f'+++\ntitle = "{title}"\naliases = {json.dumps(aliases)}\n+++\n\nSummary.\n')
+                return path
+
+            old = card("old.md", "Old")
+            original = card("original.md", "Original")
+            deleted = card("deleted.md", "Deleted")
+            checkpoint.init(out)
+            checkpoint.commit(out, "baseline")
+            card("old.md", "Changed")
+            deleted.unlink()
+            renamed = root / "renamed.md"
+            checkpoint.git(out, "mv", str(original), str(renamed))
+            staged = card("staged.md", "Staged")
+            checkpoint.git(out, "add", str(staged))
+            untracked = card("space and\n换行.md", "Database", ["Storage"])
+            overview = root / "overview.md"
+            overview.write_text("# Overview\n")
+            nested = card("topic/overview.md", "Topic overview")
+
+            self.assertEqual(checkpoint.created(out), {renamed, staged, untracked, overview, nested})
+            self.assertEqual(checkpoint.changed(out), {old, renamed, staged, untracked, overview, nested})
+            job = pipeline.Job(sources=[], dicts=[], prompt="", out=out, harness=[])
+            issues = pipeline.not_looked_up(job, ["Storage"])
+            self.assertEqual({Path(issue["file"]) for issue in issues}, {renamed, staged, nested})
+            self.assertTrue(all(issue["code"] == "not_looked_up" for issue in issues))
 
 
 if __name__ == "__main__":

@@ -49,15 +49,16 @@ def validate(out: Path, slice_dir: Path | None = None) -> dict:
 
 
 def card_names(card: Path) -> list[str]:
-    """A card's title and aliases; its file name when it has no readable frontmatter."""
+    """A card's title and aliases, or no names when its frontmatter is unreadable."""
     text = card.read_text(encoding="utf-8", errors="replace")
     try:
-        meta = tomllib.loads(text.split("+++")[1]) if text.startswith("+++") else {}
-    except (IndexError, tomllib.TOMLDecodeError):
+        lines = text.splitlines()
+        meta = tomllib.loads("\n".join(lines[1:lines.index("+++", 1)])) if lines and lines[0] == "+++" else {}
+    except (ValueError, tomllib.TOMLDecodeError):
         meta = {}
     aliases = meta.get("aliases") if isinstance(meta.get("aliases"), list) else []
     names = [name for name in [meta.get("title"), *aliases] if isinstance(name, str) and name.strip()]
-    return names or [card.stem]
+    return names
 
 
 def issues(report: dict, files: set[Path] | None = None) -> list[dict]:

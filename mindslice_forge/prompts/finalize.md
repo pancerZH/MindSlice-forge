@@ -53,6 +53,12 @@ The user's conversion instructions:
 - Write only inside the slice directories under `{{slices_dir}}`, plus the report. Do not create
   new slices, do not use `mindslice write`, and do not run `git`.
 - Cards state only what the sources say. This session adds no new knowledge.
+- Before creating any card, including when splitting a long one, run `{{lookup}} "<name>"`.
+  Search one name at a time and read matching cards before deciding to create or merge. The
+  build requires a successful lookup from this session or its repairs for every new card:
+  the whole query must occur in its title or an alias, or the whole title or alias in the query
+  (ignoring case, respecting Latin word boundaries). Earlier chunks' lookups do not count.
+  Slice overviews are exempt.
 
 ## Card format
 

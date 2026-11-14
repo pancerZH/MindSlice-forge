@@ -212,29 +212,28 @@ def extract(job: Job, state: dict, chunk: dict, position: str, previous: str | N
                     position=position, out=job.out, slices_dir=job.out / "slices",
                     previous_handoff=handoff / f"{previous}.md" if previous else "(none: this is the first chunk)",
                     handoff_file=handoff / f"{chunk['id']}.md", ledger_file=job.work / "ledger" / f"{chunk['id']}.md")
-    earlier = len(lookup.queries(job.out))  # only lookups made for this chunk count for it
-    run_step(job, step, prompt, lambda: check_chunk(job, chunk, earlier))
+    run_step(job, step, prompt, lambda: check_chunk(job, chunk), check_lookups=True)
     checkpoint.commit(job.out, f"chunk {chunk['id']}: {title}")
     state["chunks_done"].append(chunk["id"])
     state["finalized"] = False
     progress.save(job.state_file, state)
 
 
-def check_chunk(job: Job, chunk: dict, earlier_lookups: int) -> list[dict]:
+def check_chunk(job: Job, chunk: dict) -> list[dict]:
     notes = [job.work / "ledger" / f"{chunk['id']}.md", job.work / "handoff" / f"{chunk['id']}.md"]
     issues = [problem(f"{path.parent.name}/{path.name} was not written", path) for path in notes if not has_text(path)]
-    issues += not_looked_up(job, lookup.queries(job.out)[earlier_lookups:])
     return issues + engine.issues(engine.validate(job.out), checkpoint.changed(job.out))
 
 
 def not_looked_up(job: Job, queries: list[str]) -> list[dict]:
-    """Look before you write, enforced: every card this chunk created must have had its name looked up."""
+    """Every new card in this step needs a successful lookup naming it."""
     slices = (job.out / "slices").resolve()
+    overviews = {directory / "overview.md" for directory in slices.glob("*.slice")}
     new_cards = sorted(path for path in checkpoint.created(job.out)
-                       if slices in path.parents and path.suffix == ".md" and path.name != "overview.md")
+                       if slices in path.parents and path.suffix == ".md" and path not in overviews)
     return [{"severity": "error", "code": "not_looked_up", "file": str(card),
              "message": "this card was created without looking up its title or an alias. Look it up now, with the "
-                        "lookup command of the task; if the workspace already has a card for the same thing, "
+                        f"command {lookup_command(job)}; if the workspace already has a card for the same thing, "
                         "merge the two into the one that existed first"}
             for card in new_cards if not lookup.covered(engine.card_names(card), queries)]
 
@@ -244,11 +243,11 @@ def finalize(job: Job, state: dict, total: int) -> None:
     done = len(state["chunks_done"])
     coverage = f"{done} of {total} chunks" + ("" if done == total else " (a partial, sample build)")
     prompt = render("finalize", plan_file=job.work / "plan.md", user_prompt=job.prompt or NO_PROMPT,
-                    out=job.out, slices_dir=job.out / "slices", ledger_dir=job.work / "ledger",
+                    out=job.out, lookup=lookup_command(job), slices_dir=job.out / "slices", ledger_dir=job.work / "ledger",
                     report_file=job.work / "report.md", coverage=coverage,
                     profile_file=job.work / "profile.md", manifest_file=job.chunks / "manifest.json",
                     issues=format_issues(engine.issues(engine.validate(job.out))) or "(none)")
-    run_step(job, "finalize", prompt, lambda: check_final(job))
+    run_step(job, "finalize", prompt, lambda: check_final(job), check_lookups=True)
     checkpoint.commit(job.out, "finalize")
     state["finalized"] = True
     progress.save(job.state_file, state)
@@ -265,9 +264,10 @@ def check_final(job: Job) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def run_step(job: Job, step: str, prompt: str, check: Check) -> None:
+def run_step(job: Job, step: str, prompt: str, check: Check, *, check_lookups: bool = False) -> None:
     """Run the step's agent session, retrying from a clean workspace if it fails, then settle its result."""
     for delay in (*harness.BACKOFF, None):
+        earlier = len(lookup.queries(job.out)) if check_lookups else 0
         if session(job, step, prompt):
             break
         checkpoint.rollback(job.out)
@@ -276,7 +276,14 @@ def run_step(job: Job, step: str, prompt: str, check: Check) -> None:
                              f"see {job.work / 'logs' / (step + '.log')}")
         log(f"[{step}] the session failed; retrying in {delay}s")
         time.sleep(delay)
-    settle(job, step, check, task=step)
+
+    def checked() -> list[dict]:
+        issues = check()
+        if check_lookups:
+            issues += not_looked_up(job, lookup.queries(job.out)[earlier:])
+        return issues
+
+    settle(job, step, checked, task=step)
 
 
 def settle(job: Job, step: str, check: Check, task: str) -> None:

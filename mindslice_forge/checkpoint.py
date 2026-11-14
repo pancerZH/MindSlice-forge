@@ -48,14 +48,23 @@ def rollback(out: Path, ref: str = "HEAD") -> None:
 
 def changed(out: Path) -> set[Path]:
     """Files created or modified since the last commit."""
-    return {path for _, path in _status(out)}
+    return _diff(out) | _untracked(out)
 
 
 def created(out: Path) -> set[Path]:
     """Files created since the last commit."""
-    return {path for code, path in _status(out) if code == "??"}
+    return _diff(out, "--diff-filter=A") | _untracked(out)
 
 
-def _status(out: Path) -> list[tuple[str, Path]]:
-    entries = git(out, "status", "--porcelain", "-z", "--untracked-files=all").split("\0")
-    return [(entry[:2], (out / entry[3:]).resolve()) for entry in entries if entry]
+def _diff(out: Path, *args: str) -> set[Path]:
+    # Compare both the index and working tree to HEAD; staged additions also count as new.
+    # Treat renames as delete/add so their destination cannot evade the lookup check.
+    return _paths(out, git(out, "diff", "--name-only", "--no-renames", "-z", *args, "HEAD", "--"))
+
+
+def _untracked(out: Path) -> set[Path]:
+    return _paths(out, git(out, "ls-files", "--others", "--exclude-standard", "-z"))
+
+
+def _paths(out: Path, names: str) -> set[Path]:
+    return {path for name in names.split("\0") if name and (path := (out / name).resolve()).is_file()}

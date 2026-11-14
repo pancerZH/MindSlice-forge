@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mindslice_forge import ForgeError, cli, engine, harness, lookup, pipeline, profile, split, state
 
@@ -244,16 +245,44 @@ class EngineIssuesTest(unittest.TestCase):
 class LookupTest(TempDirTest):
     def test_a_lookup_covers_a_card_it_names(self):
         names = ["叶凡（灵墟洞天初修期）", "圣体叶凡"]
-        for query in ("叶凡", "叶凡 灵墟洞天", "圣体叶凡是谁", "灵墟洞天初修期"):
+        for query in ("叶凡", "圣体叶凡是谁", "灵墟洞天初修期"):
             self.assertTrue(lookup.covered(names, [query]), query)
-        for query in ("庞博", "荒古禁地 红果", ""):
+        for query in ("庞博", "荒古禁地 红果", "叶凡 无关的名字", ""):
             self.assertFalse(lookup.covered(names, [query]), query)
 
     def test_coverage_ignores_case_and_needs_some_lookup(self):
-        self.assertTrue(lookup.covered(["Deploy Rollback"], ["unrelated", "ROLLBACK procedure"]))
+        self.assertTrue(lookup.covered(["Deploy Rollback"], ["unrelated", "ROLLBACK"]))
         self.assertTrue(lookup.covered(["API keys"], ["where are the api keys stored"]))
         self.assertFalse(lookup.covered(["Deploy Rollback"], []))
         self.assertFalse(lookup.covered([], ["anything"]))
+
+    def test_unrelated_words_and_partial_latin_words_do_not_cover_a_name(self):
+        for name, query in (("Capital", "API"), ("Database", "a"), ("Hero", "the story"),
+                            ("The database", "the deployment"), ("Deploy Rollback", "rollback procedure")):
+            self.assertFalse(lookup.covered([name], [query]), (name, query))
+        self.assertTrue(lookup.covered(["Ｈｅｒｏ in part 1"], [" hero "]))
+        self.assertTrue(lookup.covered(["API keys"], ["API    keys"]))
+
+    def test_successful_search_including_no_hits_is_recorded(self):
+        workspace = self.tmp / "ws"
+        with mock.patch.object(lookup.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+            self.assertEqual(lookup.main([str(workspace), "API", "keys"]), 0)
+        run.assert_called_once_with(["mindslice", "-w", str(workspace), "search", "API keys", "--json"])
+        self.assertEqual(lookup.queries(workspace), ["API keys"])
+
+    def test_failed_search_does_not_count(self):
+        with mock.patch.object(lookup.subprocess, "run", return_value=mock.Mock(returncode=1)):
+            self.assertEqual(lookup.main([str(self.tmp), "Hero"]), 1)
+        self.assertEqual(lookup.queries(self.tmp), [])
+
+    def test_missing_engine_and_blank_query_do_not_count(self):
+        workspace = self.tmp / "ws"
+        with mock.patch.object(lookup.subprocess, "run", side_effect=FileNotFoundError("mindslice")) as run, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(lookup.main([str(workspace), " \t"]), 2)
+            run.assert_not_called()
+            self.assertEqual(lookup.main([str(workspace), "Hero"]), 1)
+        self.assertEqual(lookup.queries(workspace), [])
 
     def test_queries_are_read_from_the_log_next_to_the_workspace(self):
         workspace = self.tmp / "ws"
@@ -273,10 +302,14 @@ class CardNamesTest(TempDirTest):
         card = self.write("a.md", '+++\ntitle = "叶凡"\naliases = ["主角", "圣体"]\ntags = ["x"]\n+++\n\n叶凡。\n')
         self.assertEqual(engine.card_names(card), ["叶凡", "主角", "圣体"])
 
-    def test_file_name_when_there_is_no_usable_frontmatter(self):
+    def test_file_name_cannot_substitute_for_title_or_alias(self):
         for name, text in (("plain-note.md", "# Heading\n\ntext\n"), ("broken.md", '+++\ntitle = "unterminated\n+++\n'),
                            ("empty.md", '+++\naliases = "not a list"\n+++\n\ntext\n')):
-            self.assertEqual(engine.card_names(self.write(name, text)), [Path(name).stem], name)
+            self.assertEqual(engine.card_names(self.write(name, text)), [], name)
+
+    def test_delimiter_inside_title_is_not_a_frontmatter_boundary(self):
+        card = self.write("a.md", '+++\ntitle = "C+++ reference"\n+++\n\nSummary.\n')
+        self.assertEqual(engine.card_names(card), ["C+++ reference"])
 
 
 class HarnessTest(TempDirTest):
@@ -324,7 +357,7 @@ class PipelineHelpersTest(TempDirTest):
         "extract": ["plan_file", "user_prompt", "dicts", "chunk_file", "chunk_title", "chunk_parts", "lookup", "position", "out",
                     "slices_dir", "previous_handoff", "handoff_file", "ledger_file"],
         "finalize": ["plan_file", "user_prompt", "out", "slices_dir", "ledger_dir", "report_file", "coverage", "issues",
-                     "profile_file", "manifest_file"],
+                     "profile_file", "manifest_file", "lookup"],
         "repair": ["task_file", "issues"],
     }
 

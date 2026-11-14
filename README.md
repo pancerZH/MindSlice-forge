@@ -92,6 +92,19 @@ cards that session touched, go to a repair session (at most `--max-repairs`). Er
 stop the build; warnings do not, and are listed in the report. A session that fails or times out
 is rolled back and retried.
 
+**Search before creating cards is a required check.** The extract and finalize prompts provide a
+`python /path/to/mindslice_forge/lookup.py WORKSPACE "name"` command. It searches the workspace
+through `mindslice search --json` and records successful searches in the forge directory's
+`lookups.jsonl`. Search each name separately. Every new card must have a title or alias covered
+by a lookup from that step or its repairs: the whole query occurs in the title/alias or vice
+versa, ignoring case and respecting Latin word boundaries. A base name can cover period cards.
+Older steps and failed attempts do not count; edits to existing cards and slice overviews are
+exempt. Missing lookups are errors that stop the build if repairs cannot resolve them.
+
+Repairs must search the missing names, read matches, and merge duplicate cards into the one that
+already existed, preserving facts and updating links. This check verifies search coverage at the
+end of the step; deciding whether two cards describe the same thing remains the agent's job.
+
 ## Output
 
 ```text
@@ -104,6 +117,7 @@ novel.workspace.forge/      the forge's own directory; delete it when the build 
 ├── profile.md, plan.md, split.py, report.md
 ├── chunks/                 the chunk files and manifest.json
 ├── ledger/, handoff/       per chunk: what was recorded, and the note for the next session
+├── lookups.jsonl           successful name searches
 └── prompts/, logs/         every prompt as it was sent, and each session's output
 ```
 

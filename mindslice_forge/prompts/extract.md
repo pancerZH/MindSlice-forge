@@ -43,9 +43,11 @@ Reference frame (the "dict"), for names and structure only, never as a source of
   `mindslice -w {{out}} read <address>` then shows a card in full, together with the cards that
   extend it.
 
-  **The build checks this.** A new card is accepted only if one of your lookups names it: a word
-  of the lookup occurs in the card's title or in one of its aliases, or the title or an alias
-  occurs in the lookup. A card created without one is sent back. Then decide:
+  **The build checks this.** Each new card needs a successful lookup from this chunk (or its
+  repair sessions). Search one name at a time: the whole lookup must occur in the card's title
+  or an alias, or the whole title or alias must occur in the lookup. Matching ignores case and
+  respects Latin word boundaries; a base name also covers its period cards. Searches from older
+  chunks or failed attempts do not count. A card created without one is sent back. Then decide:
   - nothing exists yet: create a new card at the path the plan's naming rule gives;
   - a card exists and the chunk adds to what it already covers: edit that card;
   - the thing has entered a new period, stage or state, as the plan defines them: write a new card
