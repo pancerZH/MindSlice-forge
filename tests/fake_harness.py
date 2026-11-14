@@ -13,11 +13,14 @@ on request through the ``FAKE_MODES`` environment variable (comma-separated):
     fail_after_lookup  chunk 0002 looks up a name then fails; its retry omits the lookup
     finalize_card     finalize creates a card without a lookup
     repair_new_card   the first extract repair creates another card without a lookup
+    probe_silent      the harness check is not answered
+    probe_blind       the harness check is answered without the engine and without reading the source
 
-Every session is recorded in ``<forge dir>/fake-calls.log``.
+Every session is recorded in ``<forge dir>/fake-calls.log``, every harness check in ``fake-probes.log``.
 """
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -161,6 +164,24 @@ def finalize() -> None:
     (SLICE / "overview.md").write_text("# Demo\n\nStart with [[story/hero]].\n", encoding="utf-8")
     (WORK / "report.md").write_text("# Report\n", encoding="utf-8")
 
+
+def probe() -> None:
+    task = PROMPT.read_text(encoding="utf-8")
+    source, answer, token = (re.search(pattern, task).group(1) for pattern in (
+        r"this file, without changing it: `([^`]+)`", r"Write the file `([^`]+)`", r"the code `([^`]+)`"))
+    with open(WORK / "fake-probes.log", "a", encoding="utf-8") as fh:
+        fh.write(STEP + "\n")
+    if "probe_silent" in MODES:
+        return
+    engine = subprocess.run(["mindslice", "--version"], capture_output=True, text=True).stdout.strip()
+    lines = [token, "mindslice: command not found", "permission denied"] if "probe_blind" in MODES else \
+        [token, engine, str(Path(source).stat().st_size)]
+    Path(answer).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+if STEP == "probe":
+    probe()
+    sys.exit(0)
 
 earlier = CALLS.read_text(encoding="utf-8").split().count(STEP) if CALLS.exists() else 0
 with open(CALLS, "a", encoding="utf-8") as fh:

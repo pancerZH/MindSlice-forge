@@ -3,16 +3,17 @@
 Turn documents into a [MindSlice](https://github.com/pancerZH/MindSlice) workspace.
 
 MindSlice is the memory engine. The forge is the tool that fills it: it takes one long document, a
-folder of many files, or a mixture, drives an agent harness (such as Antigravity's `agy`) through
-the conversion, and checks every result with the `mindslice` command. Sources of any size work,
+folder of many files, or a mixture, drives the agent harness you choose through the conversion,
+and checks every result with the `mindslice` command. Sources of any size work,
 because they are read in chunks and each chunk is handled by a fresh agent session that continues
 the work of the ones before it.
 
 The forge itself is small on purpose. It keeps the inventory, the state, the checkpoints and the
 checks; everything that needs understanding of the text is done by the agent, following the
-templates in [`mindslice_forge/prompts/`](mindslice_forge/prompts/).
+templates in [`mindslice_forge/prompts/`](https://github.com/pancerZH/MindSlice-forge/tree/main/mindslice_forge/prompts).
 
-Python 3.12+, standard library only. Needs `mindslice`, `git` and an agent harness on `PATH`.
+Python 3.12+, standard library only. Needs `mindslice` 0.1.0 or newer, `git`, and an agent harness
+that can run a session unattended from the command line.
 
 ## When to use Forge
 
@@ -32,18 +33,21 @@ engine does not call an LLM or require Forge as a runtime dependency.
 ## Install
 
 ```bash
-git clone https://github.com/pancerZH/MindSlice-forge.git
-cd MindSlice-forge
-pipx install -e .        # or: pip install -e . inside a virtual environment
+pipx install mindslice-forge   # or: uv tool install mindslice-forge
 ```
 
-Reuse an existing checkout or installation when available. Install MindSlice separately and make
-sure the chosen harness is authenticated and its model is available.
+Install the MindSlice engine the same way (`pipx install mindslice`): Forge and the agent sessions
+it starts call the `mindslice` command by name, so both must be on `PATH`. Make sure the harness
+you will use is authenticated and its model is available.
+
+*(For local development from source: `git clone https://github.com/pancerZH/MindSlice-forge.git && cd MindSlice-forge && pipx install -e .`.)*
 
 ## Use
 
 ```bash
+HARNESS='...'   # the command that runs one agent session: see "The harness command" below
 mindslice-forge novel.txt \
+    --harness-cmd "$HARNESS" \
     --dict wiki-summary.txt \
     --prompt "Extract the world and its background for solo role-play. Record how a thing changes over time as several cards that extend one another, not as one crowded card." \
     --sample 2 \
@@ -58,27 +62,61 @@ mindslice-forge novel.txt \
 | `-o, --output DIR` | The workspace to create. Default: `./<first source name>.workspace`. |
 | `--sample N` | Process only the first N chunks, to try a prompt before a long run. |
 | `--chunk-size CHARS` | Target size of a chunk. Default 100000 characters. |
-| `--harness agy\|claude`, `--model M` | The agent harness preset and its model. |
-| `--harness-cmd TEMPLATE` | Any other harness, as a command with `{message}`, `{prompt_file}` or `{workdir}`. |
+| `--harness-cmd COMMAND` | The command line that runs one agent session; see [The harness command](#the-harness-command). Needed for everything except `--dry-run`. |
 | `--from STAGE` | Redo the build from `plan`, `split`, `extract` or `finalize`. |
-| `--dry-run` | Show the inventory and what would run. Calls no agent and writes nothing. |
+| `--dry-run` | Show the inventory, the directories a session must reach and what would run. Calls no agent and writes nothing. |
 
 ```bash
-mindslice-forge ./project-docs ./adr --prompt "Rules, architecture and operating procedures for new engineers."
+mindslice-forge ./project-docs ./adr --harness-cmd "$HARNESS" \
+    --prompt "Rules, architecture and operating procedures for new engineers."
 ```
 
 **Running the same command again continues an unfinished build.** A typical session:
 
 ```bash
-mindslice-forge novel.txt --prompt prompt.md --sample 2   # try two chunks
+mindslice-forge novel.txt --harness-cmd "$HARNESS" --prompt prompt.md --sample 2   # try two chunks
 git -C novel.workspace log -p                             # see what each chunk produced
 # edit prompt.md
-mindslice-forge novel.txt --prompt prompt.md --sample 2 --from extract   # extract again
-mindslice-forge novel.txt --prompt prompt.md              # satisfied: run the rest
+mindslice-forge novel.txt --harness-cmd "$HARNESS" --prompt prompt.md --sample 2 --from extract   # extract again
+mindslice-forge novel.txt --harness-cmd "$HARNESS" --prompt prompt.md              # satisfied: run the rest
 ```
 
 If the sources, the dict, the prompt or the chunk size change after a build has started, the forge
 refuses to continue silently: say which stage to redo with `--from`, or choose another output.
+
+## The harness command
+
+Forge knows no agent product. You give it the command line that runs **one agent session** of
+the harness you use, with its model and options, and Forge runs that command once per step: from
+the forge directory, with no terminal attached, after filling in the placeholders `{message}`
+(one line telling the agent to read the prompt file and do what it says), `{prompt_file}` and
+`{workdir}`. Do not quote the placeholders. The command must:
+
+- contain `{message}` or `{prompt_file}`, so that the agent receives its task;
+- name files and directories by absolute paths, as it does not run from your directory;
+- end when the task is done, with exit status 0 on success;
+- never wait for an answer: no questions, and no permission prompts for reading and writing
+  files or running shell commands;
+- let the agent write in the workspace and the forge directory and read the sources and every
+  `--dict` (`--dry-run` lists these directories);
+- give the agent's shell a `PATH` with the `mindslice` command.
+
+`mindslice-forge --help` prints the same list. Take the options from your harness's own help:
+look for its non-interactive mode (often called print, exec or headless), the option that
+approves tool use without asking, the option for the model, and, if it limits file access, the
+option that grants directories. As an illustration only, this is such a command for Antigravity's
+`agy`; other harnesses, and other versions of this one, have their own options:
+
+```bash
+HARNESS='agy --print={message} --dangerously-skip-permissions --disable-slash-commands --output-format stream-json \
+  --model <model> --add-dir /abs/novel.workspace --add-dir /abs/sources'
+```
+
+**A new command is checked before it is used.** Before the first step with a command, one short
+session has to run `mindslice --version`, read a source file and write a file in the workspace.
+If it cannot, the build stops there, within seconds or minutes, and says which requirement
+failed and how the session's log ends. The command that passed is recorded in the forge
+directory; changing the command, for example to another model, checks it again.
 
 ## One document or many
 
@@ -131,9 +169,9 @@ end of the step; deciding whether two cards describe the same thing remains the 
 novel.workspace/            a MindSlice workspace, ready for `mindslice -w novel.workspace ...`
 ├── mounts.toml, overlay/, staging/
 ├── slices/<name>.slice/    the cards, mounted
-└── .git/                   one commit per finished chunk: the checkpoints
+└── .git/                   one commit per finished chunk: the checkpoints (slices and mounts only)
 novel.workspace.forge/      build state and evidence; keep it for resume and review
-├── state.json              progress
+├── state.json, harness.json  progress, and the harness command that passed its check
 ├── profile.md, plan.md, split.py, report.md
 ├── chunks/                 the chunk files and manifest.json
 ├── ledger/, handoff/       per chunk: what was recorded, and the note for the next session
@@ -150,6 +188,14 @@ the sources.
 it and mounts the generated slices; do not run `mindslice init` there first. After checking the
 report, validation and representative facts, use `mindslice -w <output> ...` or connect your
 agent's MCP server to that workspace.
+
+A connected workspace can still be built further: run the same command to continue a sample, or
+use `--from` to redo a stage. What the agent has learned in the meantime (`overlay/`, `staging/`
+and the engine's `.history/`) is kept out of the checkpoints, so no rerun, retry or rollback
+touches it. If the slices or the mount table were changed outside the forge, by `mindslice bake`,
+`mount` or `unmount` or by hand, the forge stops and lists the changes instead of discarding
+them; build into another output and mount its slices. Do not bake or change mounts while a build
+is running.
 
 **For an existing workspace**, build into a separate new directory. Forge cannot take over a
 nonempty workspace that it did not create. Inspect the resulting `slices/*.slice` aliases and
@@ -181,10 +227,11 @@ checks; a sampled build remains partial after it is connected to an agent.
   not honor project ignore files or forbidden-directory markers. Pass selected files or prepare
   an allowed snapshot with exclusions applied before traversal. Keep output, reference files and
   conversion prompts outside the source directories.
-- The agent runs with tool permissions approved automatically, and the splitter is a program the
-  agent wrote. Convert sources you trust, or run the forge in a sandbox.
+- The harness command you give runs agents with tool permissions approved automatically, and the
+  splitter is a program the agent wrote. Convert sources you trust, or run the forge in a sandbox.
 - Forge writes its output workspace and sibling `.forge/` directory. It refuses to take over an
-  existing nonempty output it did not create. Workspace rollbacks happen inside its output directory.
+  existing nonempty output it did not create. Rollbacks happen inside its output directory and
+  cover the slices and the mount table only, never `overlay/`, `staging/` or `.history/`.
 
 ## Tests
 
@@ -193,7 +240,7 @@ python -m unittest discover -s tests -t . -v
 ```
 
 The unit tests need nothing. The functional tests run whole builds with the real `mindslice` and
-`git` commands and a fake agent ([`tests/fake_harness.py`](tests/fake_harness.py)); no model is
+`git` commands and a fake agent ([`tests/fake_harness.py`](https://github.com/pancerZH/MindSlice-forge/blob/main/tests/fake_harness.py)); no model is
 called.
 
 ### Checking a first real run

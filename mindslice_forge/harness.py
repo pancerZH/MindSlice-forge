@@ -1,8 +1,9 @@
 """Run one non-interactive agent session.
 
-A harness is a command line. The prompt is written to a file and the command only carries a
-one-line message pointing at it, so prompt length and quoting never matter and any agent with
-file tools can be used.
+A harness is a command line, given by the caller: the forge knows no agent product, only what
+it needs from a session (``CONTRACT``). The prompt is written to a file and the command only
+carries a one-line message pointing at it, so prompt length and quoting never matter and any
+agent with file tools can be used.
 """
 
 from __future__ import annotations
@@ -15,26 +16,39 @@ from . import ForgeError
 
 MESSAGE = "Read the file {prompt_file} and carry out the task it describes, completely and exactly."
 
-# Placeholders: {message} (the line above), {prompt_file}, {workdir}.
-PRESETS = {
-    "agy": ["agy", "--print={message}", "--dangerously-skip-permissions", "--disable-slash-commands",
-            "--output-format", "stream-json"],
-    "claude": ["claude", "-p", "{message}", "--permission-mode", "bypassPermissions",
-               "--output-format", "stream-json", "--verbose"],
-}
+# Shown by ``mindslice-forge --help``: an agent that composes the command reads it there.
+CONTRACT = """\
+the harness command:
+  --harness-cmd is the command line that runs one agent session of the harness you choose, with
+  its model and options. The forge runs it once per step, from the forge directory, with no
+  terminal attached, after filling in these placeholders (do not quote them):
+    {message}      one line telling the agent to read the prompt file and do what it says
+    {prompt_file}  the path of the prompt file
+    {workdir}      the forge directory
+  The command must:
+    - contain {message} or {prompt_file}, so that the agent receives its task;
+    - name files and directories by absolute paths, as it does not run from your directory;
+    - end when the task is done, with exit status 0 on success;
+    - never wait for an answer: no questions, and no permission prompts for reading and writing
+      files or running shell commands;
+    - let the agent write in the workspace and the forge directory and read the sources and
+      every --dict (--dry-run lists these directories);
+    - give the agent's shell a PATH with the `mindslice` command.
+  Before the first step with a new command, one short session checks all of this.
+"""
 
 BACKOFF = (30, 120, 300)  # seconds to wait before each retry of a failed session
 
 
-def template(preset: str, custom: str | None, model: str | None, dirs: list[Path]) -> list[str]:
-    """The command template: a custom one as given, or a preset with the model and readable directories."""
-    if custom:
-        return shlex.split(custom)
-    cmd = list(PRESETS[preset])
-    if model:
-        cmd += ["--model", model]
-    for d in dirs:
-        cmd += ["--add-dir", str(d)]
+def template(command_line: str) -> list[str]:
+    """The ``--harness-cmd`` command line as a list of arguments, placeholders still in place."""
+    try:
+        cmd = shlex.split(command_line)
+    except ValueError as error:
+        raise ForgeError(f"--harness-cmd cannot be read as a command line: {error}") from None
+    if not any("{message}" in part or "{prompt_file}" in part for part in cmd[1:]):
+        raise ForgeError("--harness-cmd must be a command with {message} or {prompt_file} among its arguments; "
+                         "without one the agent never receives its task. See `mindslice-forge --help`.")
     return cmd
 
 

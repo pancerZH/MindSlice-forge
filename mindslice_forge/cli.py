@@ -1,4 +1,4 @@
-"""Command line: ``mindslice-forge SOURCE... [--dict PATH] [--prompt TEXT_OR_FILE] [-o DIR] [--sample N]``."""
+"""Command line: ``mindslice-forge SOURCE... --harness-cmd COMMAND [--dict PATH] [--prompt TEXT_OR_FILE] [-o DIR]``."""
 
 from __future__ import annotations
 
@@ -13,8 +13,9 @@ from .state import STAGES
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mindslice-forge",
-        description="Turn documents into a MindSlice workspace by driving an agent harness. "
-                    "Running the same command again continues an unfinished build.")
+        description="Turn documents into a MindSlice workspace by driving an agent harness.\n"
+                    "Running the same command again continues an unfinished build.",
+        epilog=harness.CONTRACT, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("sources", nargs="+", type=Path, metavar="SOURCE", help="document or folder to convert")
     p.add_argument("--dict", dest="dicts", action="append", default=[], type=Path, metavar="PATH",
                    help="reference frame (outline, glossary, wiki page): shapes names and structure, "
@@ -26,11 +27,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--sample", type=int, metavar="N", help="process only the first N chunks")
     p.add_argument("--chunk-size", type=int, default=100_000, metavar="CHARS",
                    help="target characters per chunk (default: %(default)s)")
-    p.add_argument("--harness", choices=sorted(harness.PRESETS), default="agy",
-                   help="agent harness preset (default: %(default)s)")
-    p.add_argument("--harness-cmd", metavar="TEMPLATE",
-                   help="custom harness command; placeholders {message}, {prompt_file}, {workdir}")
-    p.add_argument("--model", help="model name passed to the harness preset")
+    p.add_argument("--harness-cmd", metavar="COMMAND",
+                   help="command line that runs one agent session, described below; "
+                        "needed for everything except --dry-run")
     p.add_argument("--timeout", type=int, default=3600, metavar="SECONDS",
                    help="time limit of one agent session (default: %(default)s)")
     p.add_argument("--max-repairs", type=int, default=2, metavar="N",
@@ -38,7 +37,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--from", dest="from_stage", choices=STAGES, metavar="STAGE",
                    help=f"redo the build from this stage on: {', '.join(STAGES)}")
     p.add_argument("--dry-run", action="store_true",
-                   help="show the source inventory and what would run; call no agent, write nothing")
+                   help="show the source inventory, the directories an agent session must reach and "
+                        "what would run; call no agent, write nothing")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 
@@ -62,10 +62,12 @@ def job_from(args: argparse.Namespace) -> pipeline.Job:
     dicts = [p.resolve() for p in args.dicts]
     first = sources[0]
     out = (args.output or Path(f"{first.name if first.is_dir() else first.stem}.workspace")).resolve()
-    readable = list(dict.fromkeys([out, *(p if p.is_dir() else p.parent for p in [*sources, *dicts])]))
+    if not args.harness_cmd and not args.dry_run:
+        raise ForgeError("--harness-cmd is needed: the command line that runs one agent session of your harness. "
+                         "`mindslice-forge --help` says what it must do; --dry-run works without it.")
     return pipeline.Job(
         sources=sources, dicts=dicts, prompt=read_prompt(args.prompt), out=out,
-        harness=harness.template(args.harness, args.harness_cmd, args.model, readable),
+        harness=harness.template(args.harness_cmd) if args.harness_cmd else [],
         sample=args.sample, chunk_size=args.chunk_size, timeout=args.timeout, max_repairs=args.max_repairs,
         from_stage=args.from_stage, dry_run=args.dry_run)
 

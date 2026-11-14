@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import tomllib
 from pathlib import Path
@@ -12,13 +13,31 @@ from . import ForgeError
 # Warnings an agent can fix in the card they are reported on. Others are left for the final report.
 FIXABLE = {"card_too_long", "missing_summary", "long_summary", "missing_title", "missing_frontmatter",
            "broken_wikilink", "frontmatter_schema"}
+MINIMUM = (0, 1, 0)  # the oldest engine with the commands, JSON output and card format this forge relies on
+
+
+def _engine(*args: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["mindslice", *args], capture_output=True, text=True, encoding="utf-8")
+    except FileNotFoundError:
+        raise ForgeError("the `mindslice` command is not on PATH; install the MindSlice engine first") from None
 
 
 def _run(*args: str) -> subprocess.CompletedProcess:
-    try:
-        return subprocess.run(["mindslice", *args, "--json"], capture_output=True, text=True, encoding="utf-8")
-    except FileNotFoundError:
-        raise ForgeError("the `mindslice` command is not on PATH; install the MindSlice engine first") from None
+    return _engine(*args, "--json")
+
+
+def version() -> str:
+    """What ``mindslice --version`` prints. An engine older than ``MINIMUM`` is an error."""
+    done = _engine("--version")
+    line = done.stdout.strip()
+    found = re.search(r"(\d+)\.(\d+)\.(\d+)", line)
+    if done.returncode != 0 or not found:
+        raise ForgeError(f"`mindslice --version` did not give a version:\n{line or done.stderr.strip()}")
+    if tuple(map(int, found.groups())) < MINIMUM:
+        raise ForgeError(f"this forge needs MindSlice {'.'.join(map(str, MINIMUM))} or newer, and `mindslice` on PATH "
+                         f"is {found.group()}; upgrade the engine, for example with `pipx upgrade mindslice`")
+    return line
 
 
 def _call(*args: str) -> dict:

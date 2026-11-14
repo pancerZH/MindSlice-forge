@@ -13,6 +13,18 @@ authors = [{ name = "pancerZH" }]
 requires-python = ">=3.12"
 dependencies = []
 keywords = ["llm", "agents", "memory", "markdown", "mindslice"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Text Processing :: Markup :: Markdown",
+]
+
+[project.urls]
+Homepage = "https://github.com/pancerZH/MindSlice-forge"
+Issues = "https://github.com/pancerZH/MindSlice-forge/issues"
+MindSlice = "https://github.com/pancerZH/MindSlice"
 
 [project.scripts]
 mindslice-forge = "mindslice_forge.cli:main"

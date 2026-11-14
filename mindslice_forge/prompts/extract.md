@@ -77,6 +77,10 @@ Reference frame (the "dict"), for names and structure only, never as a source of
 - Cards: only inside the slice directories under `{{slices_dir}}`, as files you create or edit
   directly. Do not create new slices, do not change `slice.toml`, and do not use `mindslice write`.
 - Do not modify the chunk files or the plan, and do not run `git`.
+- This build has a workspace of its own. If this session also offers a memory tool or a MindSlice
+  server (through MCP, for example), that belongs to the user's other work: do not search it, read
+  it or write to it, and standing instructions that came with it, such as to record what you learn,
+  do not apply to this task.
 
 ## Before you finish
 

@@ -7,7 +7,9 @@ workspace and recorded in ``state.json``, so running the same command again cont
 
 from __future__ import annotations
 
+import json
 import re
+import secrets
 import shlex
 import shutil
 import sys
@@ -24,6 +26,7 @@ NO_PROMPT = "(none given: build a faithful, general-purpose knowledge base of th
 SPLIT_NEEDED = "The sources are too large to read in one session, so you must also write the splitter."
 SPLIT_NOT_NEEDED = "The sources fit in one session and will be read as a single chunk: do NOT write a splitter."
 MAX_ISSUES_SHOWN = 50
+PROBE_TIMEOUT = 300  # seconds: the harness check is a task of a few tool calls
 
 Check = Callable[[], list[dict]]
 
@@ -70,9 +73,11 @@ def run(job: Job) -> None:
         log(f"Reference frame:\n{bullets(job.dicts)}\n")
         log(f"Workspace: {job.out}\nForge directory: {job.work}")
         log(f"Splitting: {'needed' if needs_split else 'not needed'} at {job.chunk_size} characters per chunk")
-        log(f"Harness: {' '.join(job.harness)}")
+        log(f"An agent session must reach:\n{reach(job)}")
+        log(f"Harness: {shlex.join(job.harness) if job.harness else '(no --harness-cmd given)'}")
         return
 
+    engine.version()
     state = start(job, sources)
     (job.work / "profile.md").write_text(inventory, encoding="utf-8")
     if not state["plan"]:
@@ -307,11 +312,61 @@ def settle(job: Job, step: str, check: Check, task: str) -> None:
 
 def session(job: Job, name: str, prompt: str) -> bool:
     """One fresh agent session. The rendered prompt and the session log are kept in the forge directory."""
+    check_harness(job)
     prompt_file = job.work / "prompts" / f"{name}.md"
     prompt_file.parent.mkdir(parents=True, exist_ok=True)
     prompt_file.write_text(prompt, encoding="utf-8")
     cmd = harness.command(job.harness, prompt_file, job.work)
+    checkpoint.begin(job.out)
     return harness.run(cmd, job.work, job.work / "logs" / f"{name}.log", job.timeout)
+
+
+def check_harness(job: Job) -> None:
+    """Before the first session with a harness command, prove with a short one that it works.
+
+    The forge does not know the harness, so a command that cannot do the work must fail here, in
+    seconds and with the reason, not after a long step and its retries. The command that passed
+    is recorded in the forge directory, and is not checked again."""
+    record = job.work / "harness.json"
+    if record.exists() and json.loads(record.read_text(encoding="utf-8")) == job.harness:
+        return
+    log("[harness] checking the harness command with one short session")
+    engine_version, source = engine.version(), profile.scan(job.sources)[0][0].path
+    token, answer_file = secrets.token_hex(4), job.out / "forge-probe.txt"
+    prompt_file, log_file = job.work / "prompts" / "probe.md", job.work / "logs" / "probe.log"
+    prompt_file.parent.mkdir(parents=True, exist_ok=True)
+    prompt_file.write_text(render("probe", source=source, probe_file=answer_file, token=token), encoding="utf-8")
+    cmd = harness.command(job.harness, prompt_file, job.work)
+    timeout = min(job.timeout, PROBE_TIMEOUT)
+    checkpoint.begin(job.out)
+    try:  # no step is unfinished when a run reaches its first session, so the rollback only removes the answer
+        finished = harness.run(cmd, job.work, log_file, timeout)
+        answer = answer_file.read_text(encoding="utf-8", errors="replace") if answer_file.is_file() else None
+    finally:
+        checkpoint.rollback(job.out)
+
+    problems = []
+    if not finished:
+        problems.append(f"the command did not end with exit status 0 within {timeout}s")
+    if answer is None:
+        problems.append(f"the session did not write {answer_file}: the agent must receive its task, use its tools "
+                        "without asking for permission, and be able to write in the workspace")
+    else:
+        if token not in answer:
+            problems.append(f"the session wrote {answer_file} without the code from its prompt")
+        if engine_version not in answer:
+            problems.append(f"`mindslice --version` did not print `{engine_version}` in the session: "
+                            "the agent's shell needs the same `mindslice` on its PATH")
+        if str(source.stat().st_size) not in answer.replace(",", ""):
+            problems.append(f"the session did not find the size of {source}: the agent must be able to read the sources")
+    if problems:
+        tail = log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-12:]
+        raise ForgeError("the harness command cannot run this build:\n" + "\n".join(f"- {p}" for p in problems)
+                         + f"\nCommand: {shlex.join(cmd)}\nThe end of the session log, {log_file}:\n"
+                         + "\n".join(f"  {line[:300]}" for line in tail)
+                         + "\n`mindslice-forge --help` says what the command must do.")
+    record.write_text(json.dumps(job.harness, ensure_ascii=False) + "\n", encoding="utf-8")
+    log("[harness] the command works")
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +402,13 @@ def lookup_command(job: Job) -> str:
 def parts_list(chunk: dict) -> str:
     """Which source lines a chunk holds: a chunk can span several files, and a file several chunks."""
     return "\n".join(f"- `{p['source']}`, lines {p['start_line']}-{p['end_line']}" for p in chunk["parts"]) or "(none)"
+
+
+def reach(job: Job) -> str:
+    """The directories a session of the harness command works in, for whoever composes that command."""
+    read = dict.fromkeys(p if p.is_dir() else p.parent for p in [*job.sources, *job.dicts])
+    return "\n".join([f"- `{job.work}` (its working directory; read and write)", f"- `{job.out}` (read and write)",
+                      *(f"- `{directory}` (read)" for directory in read)])
 
 
 def bullets(paths: list[Path]) -> str:

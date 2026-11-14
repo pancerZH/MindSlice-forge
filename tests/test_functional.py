@@ -41,9 +41,9 @@ class FunctionalTest(unittest.TestCase):
 
     # -- helpers ------------------------------------------------------------
 
-    def forge(self, *args, modes="", source=None):
+    def forge(self, *args, modes="", source=None, harness_cmd=FAKE):
         """Run the CLI in-process; returns (exit code, stdout, stderr)."""
-        argv = [str(source or self.novel), "-o", str(self.out), "--harness-cmd", FAKE, *map(str, args)]
+        argv = [str(source or self.novel), "-o", str(self.out), "--harness-cmd", harness_cmd, *map(str, args)]
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, {"FAKE_MODES": modes}), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -53,6 +53,11 @@ class FunctionalTest(unittest.TestCase):
     def calls(self):
         log = self.work / "fake-calls.log"
         return log.read_text(encoding="utf-8").split() if log.exists() else []
+
+    def probes(self):
+        """How many times the harness command was checked."""
+        log = self.work / "fake-probes.log"
+        return len(log.read_text(encoding="utf-8").split()) if log.exists() else 0
 
     def forget_calls(self):
         (self.work / "fake-calls.log").unlink()
@@ -64,6 +69,16 @@ class FunctionalTest(unittest.TestCase):
         done = subprocess.run(["mindslice", "-w", str(self.out), *args, "--json"], capture_output=True, text=True,
                               encoding="utf-8")
         return json.loads(done.stdout)
+
+    def write_memory(self, card, *options):
+        """Write a card the way an agent connected to the workspace does."""
+        subprocess.run(["mindslice", "-w", str(self.out), "write", card, "--title", card, "--summary", "A note.",
+                        "--content", "Learned in conversation.", *options], check=True, capture_output=True)
+
+    def memory(self):
+        """Every file of the workspace's live memory, with its content."""
+        return {path.relative_to(self.out).as_posix(): path.read_bytes()
+                for name in checkpoint.LIVE for path in (self.out / name).rglob("*") if path.is_file()}
 
     def manifest(self):
         return json.loads((self.work / "chunks" / "manifest.json").read_text(encoding="utf-8"))
@@ -313,6 +328,54 @@ class FunctionalTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.calls(), [])
 
+    def test_memory_of_a_connected_workspace_survives_resume_retry_and_redo(self):
+        self.assertEqual(self.forge(*NOVEL_ARGS, "--sample", "1")[0], 0)
+        # What an agent connected to the sample build leaves behind: a card, a proposal and history.
+        self.write_memory("prefs/reply", "--no-stage")
+        self.write_memory("tooling/python", "--stage")
+        memory = self.memory()
+        self.assertLessEqual({"overlay/prefs/reply.md", "staging/tooling/python.md"}, set(memory))
+        self.assertTrue(any(name.startswith(".history/") for name in memory))
+
+        code, _, err = self.forge(*NOVEL_ARGS, modes="fail_once")  # resume, with a session that is rolled back
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls().count("extract-0002"), 2)
+        self.assertFalse((self.out / "slices/demo.slice/junk.md").exists())
+        self.assertEqual(self.memory(), memory)
+
+        code, _, err = self.forge(*NOVEL_ARGS, "--from", "plan")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.memory(), memory)
+        self.assertEqual(checkpoint.git(self.out, "ls-files", "overlay", "staging", ".history"), "")
+
+    def test_bake_or_mount_in_a_connected_workspace_is_never_rolled_back(self):
+        self.assertEqual(self.forge(*NOVEL_ARGS, "--sample", "1")[0], 0)
+        self.write_memory("story/hero-note", "--extends", "@demo/story/hero", "--no-stage")
+        subprocess.run(["mindslice", "-w", str(self.out), "bake", "@demo"], check=True, capture_output=True)
+        mounts = (self.out / "mounts.toml").read_text(encoding="utf-8")
+        baked = [path for path in (self.out / "slices").glob("*.slice") if path.name != "demo.slice"]
+        self.assertEqual(len(baked), 1)
+        self.forget_calls()
+
+        for args in ([], ["--from", "extract"], ["--from", "plan"]):
+            code, _, err = self.forge(*NOVEL_ARGS, *args)
+            self.assertEqual(code, 1)
+            self.assertIn("changes that the forge did not make", err)
+            self.assertIn("mounts.toml", err)
+            self.assertIn(f"slices/{baked[0].name}/", err)
+            self.assertEqual(self.calls(), [])
+            self.assertEqual((self.out / "mounts.toml").read_text(encoding="utf-8"), mounts)
+            self.assertTrue((baked[0] / "story/hero-note.md").is_file())
+            self.assertEqual(self.state()["chunks_done"], ["0001"])
+
+    def test_workspace_without_its_checkpoints_is_not_rolled_back(self):
+        self.assertEqual(self.forge(*NOVEL_ARGS, "--sample", "1")[0], 0)
+        shutil.rmtree(self.out / ".git")
+        code, _, err = self.forge(*NOVEL_ARGS)
+        self.assertEqual(code, 1)
+        self.assertIn("has no forge checkpoints", err)
+        self.assertTrue((self.out / "slices/demo.slice/story/hero.md").is_file())
+
     def test_changed_prompt_is_refused_until_a_stage_is_redone(self):
         self.assertEqual(self.forge(*NOVEL_ARGS, "--sample", "1", "--prompt", "世界观")[0], 0)
         self.forget_calls()
@@ -344,7 +407,50 @@ class FunctionalTest(unittest.TestCase):
         self.assertEqual(self.calls(), ["extract-0001", "extract-0002", "finalize"])
         self.assertIn("2 of 2 chunks processed", out)
 
+    def test_new_harness_command_is_checked_once_before_the_build(self):
+        code, out, err = self.forge(*NOVEL_ARGS, "--sample", "1")
+        self.assertEqual(code, 0, err)
+        self.assertLess(out.index("[harness] the command works"), out.index("[plan] done"))
+        self.assertEqual(self.probes(), 1)
+        self.assertFalse((self.out / "forge-probe.txt").exists())
+        self.assertEqual(self.commits(), ["empty workspace", "plan", CHUNK_COMMITS[0], "finalize"])
+
+        self.assertEqual(self.forge(*NOVEL_ARGS, "--sample", "2")[0], 0)  # the same command: not checked again
+        self.assertEqual(self.forge(*NOVEL_ARGS, "--sample", "2")[0], 0)  # nothing left to do
+        self.assertEqual(self.probes(), 1)
+        self.assertEqual(self.forge(*NOVEL_ARGS, "--sample", "2", harness_cmd=FAKE + " --model other")[0], 0)
+        self.assertEqual(self.probes(), 1)  # a new command, but no session to run with it
+        self.assertEqual(self.forge(*NOVEL_ARGS, harness_cmd=FAKE + " --model other")[0], 0)
+        self.assertEqual(self.probes(), 2)
+
+    def test_harness_command_that_cannot_do_the_work_stops_before_the_build(self):
+        exits = f'{sys.executable} -c "import sys; sys.exit(3)" {{prompt_file}}'
+        for options, reasons in (({"modes": "probe_silent"}, ["did not write"]),
+                                 ({"modes": "probe_blind"}, ["on its PATH", "must be able to read the sources"]),
+                                 ({"harness_cmd": exits}, ["did not end with exit status 0", "exit status 3"])):
+            code, _, err = self.forge(*NOVEL_ARGS, **options)
+            self.assertEqual(code, 1, options)
+            self.assertIn("the harness command cannot run this build", err)
+            for reason in reasons:
+                self.assertIn(reason, err)
+            self.assertIn("mindslice-forge --help", err)
+            self.assertEqual(self.calls(), [])
+            self.assertFalse(self.state()["plan"])
+            self.assertFalse((self.out / "forge-probe.txt").exists())
+            self.assertEqual(self.commits(), ["empty workspace"])
+        code, _, err = self.forge(*NOVEL_ARGS, "--sample", "1")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls(), ["plan", "extract-0001", "finalize"])
+
     def test_dry_run_calls_no_agent_and_writes_nothing(self):
+        argv = [str(self.novel), "-o", str(self.out), *NOVEL_ARGS, "--dry-run"]  # needs no harness command
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(argv), 0)
+        self.assertIn("(no --harness-cmd given)", stdout.getvalue())
+        for directory in (self.work, self.out, self.tmp):
+            self.assertIn(f"- `{directory}` (", stdout.getvalue())
+
         code, out, err = self.forge(*NOVEL_ARGS, "--dry-run")
         self.assertEqual(code, 0, err)
         self.assertIn("gb18030", out)

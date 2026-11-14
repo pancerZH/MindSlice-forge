@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -312,16 +313,40 @@ class CardNamesTest(TempDirTest):
         self.assertEqual(engine.card_names(card), ["C+++ reference"])
 
 
-class HarnessTest(TempDirTest):
-    def test_preset_template_gets_model_and_directories(self):
-        cmd = harness.template("agy", None, "some-model", [Path("/a"), Path("/b")])
-        self.assertEqual(cmd[:2], ["agy", "--print={message}"])
-        self.assertEqual(cmd[-6:], ["--model", "some-model", "--add-dir", "/a", "--add-dir", "/b"])
-        self.assertNotIn("--model", harness.template("claude", None, None, []))
+class EngineVersionTest(unittest.TestCase):
+    def version(self, stdout, returncode=0):
+        done = subprocess.CompletedProcess(["mindslice", "--version"], returncode, stdout, "")
+        with mock.patch.object(engine.subprocess, "run", return_value=done):
+            return engine.version()
 
-    def test_custom_template_is_used_as_given(self):
-        cmd = harness.template("agy", "my-agent --flag 'two words' {prompt_file}", "ignored", [Path("/a")])
-        self.assertEqual(cmd, ["my-agent", "--flag", "two words", "{prompt_file}"])
+    def test_engine_this_forge_works_with_is_accepted(self):
+        minimum = ".".join(map(str, engine.MINIMUM))
+        self.assertEqual(self.version(f"mindslice {minimum}\n"), f"mindslice {minimum}")
+        self.assertEqual(self.version("mindslice 12.0.3\n"), "mindslice 12.0.3")
+
+    def test_older_engine_and_unreadable_version_are_errors(self):
+        with mock.patch.object(engine, "MINIMUM", (0, 2, 0)), self.assertRaisesRegex(ForgeError, "needs MindSlice 0.2.0"):
+            self.version("mindslice 0.1.9\n")
+        for stdout, returncode in (("", 0), ("usage: mindslice", 2)):
+            with self.assertRaisesRegex(ForgeError, "did not give a version"):
+                self.version(stdout, returncode)
+
+    def test_missing_engine_is_an_error(self):
+        with mock.patch.object(engine.subprocess, "run", side_effect=FileNotFoundError), \
+                self.assertRaisesRegex(ForgeError, "not on PATH"):
+            engine.version()
+
+
+class HarnessTest(TempDirTest):
+    def test_template_is_the_command_line_split_into_arguments(self):
+        cmd = harness.template("my-agent --flag 'two words' --print={message} --model some-model")
+        self.assertEqual(cmd, ["my-agent", "--flag", "two words", "--print={message}", "--model", "some-model"])
+        self.assertEqual(harness.template("my-agent {prompt_file}"), ["my-agent", "{prompt_file}"])
+
+    def test_template_that_cannot_pass_the_task_is_refused(self):
+        for line in ("", "my-agent", "my-agent --print", "{message}", "my-agent 'unclosed {message}"):
+            with self.assertRaises(ForgeError, msg=line):
+                harness.template(line)
 
     def test_command_fills_placeholders_and_leaves_other_braces_alone(self):
         prompt = Path("/work/prompts/plan.md")
@@ -369,6 +394,11 @@ class PipelineHelpersTest(TempDirTest):
                 self.assertIn(f"<<{key}>>", text, f"{name} does not use {key}")
             self.assertIn("One focused sub-topic per card", text, f"{name} lacks the card format")
 
+    def test_every_task_keeps_the_agent_out_of_the_memory_it_brought_along(self):
+        for name in ("plan", "extract", "finalize"):  # a repair session reads its task's prompt for the rules
+            text = " ".join(pipeline.render(name, **{key: "x" for key in self.VALUES[name]}).split())
+            self.assertIn("belongs to the user's other work: do not search it, read it or write to it", text, name)
+
     def test_rendered_values_are_not_expanded_again(self):
         text = pipeline.render("repair", task_file="t", issues="a {{task_file}} in a card")
         self.assertIn("a {{task_file}} in a card", text)
@@ -391,6 +421,20 @@ class PipelineHelpersTest(TempDirTest):
         self.assertEqual(pipeline.parts_list(chunk), "- `/docs/a.md`, lines 1-9\n- `/docs/b.txt`, lines 20-35")
         self.assertEqual(pipeline.parts_list({"parts": []}), "(none)")
 
+    def test_probe_prompt_renders_with_the_values_the_pipeline_passes(self):
+        text = pipeline.render("probe", source="<<source>>", probe_file="<<probe>>", token="<<token>>")
+        self.assertNotIn("{{", text)
+        for value in ("<<source>>", "<<probe>>", "<<token>>", "mindslice --version"):
+            self.assertIn(value, text)
+
+    def test_reach_lists_what_a_session_reads_and_writes(self):
+        book, frame = self.write("src/book.txt", "x\n"), self.write("ref/baike.txt", "y\n")
+        job = pipeline.Job(sources=[book, self.tmp / "src"], dicts=[frame], prompt="", out=self.tmp / "ws", harness=[])
+        self.assertEqual(pipeline.reach(job).splitlines(), [
+            f"- `{self.tmp / 'ws.forge'}` (its working directory; read and write)",
+            f"- `{self.tmp / 'ws'}` (read and write)",
+            f"- `{self.tmp / 'src'}` (read)", f"- `{self.tmp / 'ref'}` (read)"])
+
     def test_forge_directory_is_next_to_the_workspace(self):
         job = pipeline.Job(sources=[], dicts=[], prompt="", out=Path("/x/zhetian.workspace"), harness=[])
         self.assertEqual(job.work, Path("/x/zhetian.workspace.forge"))
@@ -399,7 +443,7 @@ class PipelineHelpersTest(TempDirTest):
 
 class CliTest(TempDirTest):
     def job(self, *argv):
-        return cli.job_from(cli.parser().parse_args([str(a) for a in argv]))
+        return cli.job_from(cli.parser().parse_args([str(a) for a in argv] + ["--harness-cmd", "my-agent {prompt_file}"]))
 
     def test_prompt_is_text_or_a_file(self):
         file = self.write("prompt.md", "抽取世界观\n")
@@ -414,8 +458,7 @@ class CliTest(TempDirTest):
         job = self.job(source)
         self.assertEqual(job.out, Path.cwd() / "遮天.workspace")
         self.assertEqual((job.chunk_size, job.max_repairs, job.sample, job.from_stage), (100_000, 2, None, None))
-        self.assertEqual(job.harness[0], "agy")
-        self.assertEqual(job.harness[-4:], ["--add-dir", str(job.out), "--add-dir", str(self.tmp)])
+        self.assertEqual(job.harness, ["my-agent", "{prompt_file}"])
 
     def test_default_output_keeps_a_folder_name_whole(self):
         self.write("handbook v1.2/a.md", "x\n")
@@ -425,7 +468,6 @@ class CliTest(TempDirTest):
         source, frame = self.write("a.txt", "x\n"), self.write("ref/outline.md", "y\n")
         job = self.job(source, "--dict", self.tmp / "ref")
         self.assertEqual(job.dicts, [self.tmp / "ref"])
-        self.assertIn(str(self.tmp / "ref"), job.harness)
         before = state.fingerprint([source, *profile.collect(job.dicts)], "", 1)
         frame.write_text("changed")
         self.assertNotEqual(before, state.fingerprint([source, *profile.collect(job.dicts)], "", 1))
@@ -433,24 +475,28 @@ class CliTest(TempDirTest):
     def test_options(self):
         source, frame = self.write("src/book.txt", "x\n"), self.write("ref/baike.txt", "y\n")
         job = self.job(self.tmp / "src", "--dict", frame, "--prompt", "p", "-o", self.tmp / "ws", "--sample", 2,
-                       "--chunk-size", 500, "--harness", "claude", "--model", "m", "--from", "extract",
+                       "--chunk-size", 500, "--from", "extract",
                        "--max-repairs", 0, "--timeout", 60, "--dry-run")
         self.assertEqual((job.sources, job.dicts, job.out), ([source.parent], [frame], self.tmp / "ws"))
         self.assertEqual((job.prompt, job.sample, job.chunk_size, job.from_stage), ("p", 2, 500, "extract"))
         self.assertEqual((job.max_repairs, job.timeout, job.dry_run), (0, 60, True))
-        self.assertEqual(job.harness[0], "claude")
-        self.assertIn("--model", job.harness)
-        for directory in (self.tmp / "ws", self.tmp / "src", self.tmp / "ref"):
-            self.assertIn(str(directory), job.harness)
 
-    def test_custom_harness_command_replaces_the_preset(self):
-        job = self.job(self.write("a.txt", "x\n"), "--harness-cmd", "my-agent {prompt_file}")
-        self.assertEqual(job.harness, ["my-agent", "{prompt_file}"])
+    def test_harness_command_is_needed_for_everything_except_a_dry_run(self):
+        source = str(self.write("a.txt", "x\n"))
+        with self.assertRaisesRegex(ForgeError, "--harness-cmd is needed"):
+            cli.job_from(cli.parser().parse_args([source]))
+        self.assertEqual(cli.job_from(cli.parser().parse_args([source, "--dry-run"])).harness, [])
+
+    def test_help_says_what_the_harness_command_must_do(self):
+        text = cli.parser().format_help()
+        for words in ("{message}", "{prompt_file}", "exit status 0", "no permission prompts", "`mindslice` command"):
+            self.assertIn(words, text)
 
     def test_bad_arguments_exit_with_an_error(self):
         source = self.write("a.txt", "x\n")
         for argv in ([str(source), "--sample", "0"], [str(source), "--chunk-size", "0"],
-                     [str(self.tmp / "missing.txt"), "--dry-run"]):
+                     [str(self.tmp / "missing.txt"), "--dry-run"], [str(source)],
+                     [str(source), "--harness-cmd", "an-agent-that-is-not-told-its-task"]):
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cli.main(argv), 1, argv)
