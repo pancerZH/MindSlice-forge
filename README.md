@@ -63,6 +63,8 @@ mindslice-forge novel.txt \
 | `--sample N` | Process only the first N chunks, to try a prompt before a long run. |
 | `--chunk-size CHARS` | Target size of a chunk. Default 100000 characters. |
 | `--harness-cmd COMMAND` | The command line that runs one agent session; see [The harness command](#the-harness-command). Needed for everything except `--dry-run`. |
+| `--timeout SECONDS` | Time limit of one agent session. Default 3600. A session that runs longer is rolled back and retried. |
+| `--max-repairs N` | Repair sessions allowed per step. Default 2. |
 | `--from STAGE` | Redo the build from `plan`, `split`, `extract` or `finalize`. |
 | `--dry-run` | Show the inventory, the directories a session must reach and what would run. Calls no agent and writes nothing. |
 
@@ -90,7 +92,8 @@ Forge knows no agent product. You give it the command line that runs **one agent
 the harness you use, with its model and options, and Forge runs that command once per step: from
 the forge directory, with no terminal attached, after filling in the placeholders `{message}`
 (one line telling the agent to read the prompt file and do what it says), `{prompt_file}` and
-`{workdir}`. Do not quote the placeholders. The command must:
+`{workdir}`. Do not quote the placeholders, and keep the command on one line: inside quotes, a
+shell does not join a line that ends in a backslash with the next one. The command must:
 
 - contain `{message}` or `{prompt_file}`, so that the agent receives its task;
 - name files and directories by absolute paths, as it does not run from your directory;
@@ -108,8 +111,7 @@ option that grants directories. As an illustration only, this is such a command 
 `agy`; other harnesses, and other versions of this one, have their own options:
 
 ```bash
-HARNESS='agy --print={message} --dangerously-skip-permissions --disable-slash-commands --output-format stream-json \
-  --model <model> --add-dir /abs/novel.workspace --add-dir /abs/sources'
+HARNESS='agy --print={message} --dangerously-skip-permissions --disable-slash-commands --output-format stream-json --model <model> --add-dir /abs/novel.workspace --add-dir /abs/sources'
 ```
 
 **A new command is checked before it is used.** Before the first step with a command, one short
@@ -229,6 +231,12 @@ checks; a sampled build remains partial after it is connected to an agent.
   conversion prompts outside the source directories.
 - The harness command you give runs agents with tool permissions approved automatically, and the
   splitter is a program the agent wrote. Convert sources you trust, or run the forge in a sandbox.
+- A build session is an ordinary session of your harness and loads what the harness is configured
+  with: MCP servers, standing rules, hooks. If your MindSlice memory is connected there, every
+  build session starts that workspace's MCP server as well and could write to it. The build needs
+  none of it: it works through files and the `mindslice` command in its own output. To keep your
+  memory out of a build's reach, add to the harness command the options that leave that
+  configuration out, taken from your harness's own help.
 - Forge writes its output workspace and sibling `.forge/` directory. It refuses to take over an
   existing nonempty output it did not create. Rollbacks happen inside its output directory and
   cover the slices and the mount table only, never `overlay/`, `staging/` or `.history/`.
