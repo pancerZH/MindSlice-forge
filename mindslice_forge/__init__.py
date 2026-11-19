@@ -5,7 +5,7 @@ resumable state and checks every result with the ``mindslice`` command. Everythi
 understanding of the text is done by the agent, following the templates in ``prompts/``.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 
 class ForgeError(Exception):
