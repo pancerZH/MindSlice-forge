@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mindslice-forge"
-version = "0.2.0"
+version = "0.2.1"
 description = "Turn documents into a MindSlice workspace by driving an agent harness (Python stdlib only)."
 readme = "README.md"
 license = "Apache-2.0"
