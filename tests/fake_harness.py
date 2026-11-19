@@ -15,6 +15,10 @@ on request through the ``FAKE_MODES`` environment variable (comma-separated):
     repair_new_card   the first extract repair creates another card without a lookup
     probe_silent      the harness check is not answered
     probe_blind       the harness check is answered without the engine and without reading the source
+    touch_reference   with --into, chunk 0001 also edits and adds cards in the copy of the existing workspace
+
+With --into, the plan depends on every existing slice, and the hero card extends ``people/hero`` of the
+existing workspace when it has one.
 
 Every session is recorded in ``<forge dir>/fake-calls.log``, every harness check in ``fake-probes.log``.
 """
@@ -33,6 +37,7 @@ STEP = PROMPT.stem  # plan, extract-0002, finalize, split.repair1, extract-0001.
 MODES = set(filter(None, os.environ.get("FAKE_MODES", "").split(",")))
 CALLS = WORK / "fake-calls.log"
 LOOKUP = Path(__file__).resolve().parent.parent / "mindslice_forge" / "lookup.py"
+REFERENCE = sorted((OUT / "reference").glob("*.slice"))  # with --into: the copies of the existing slices
 
 SPLITTER = '''
 import argparse, json
@@ -110,8 +115,9 @@ def note(folder: str, ident: str) -> None:
 def plan() -> None:
     (WORK / "plan.md").write_text("# Plan\n\nOne slice, @demo.\n", encoding="utf-8")
     SLICE.mkdir(parents=True, exist_ok=True)
-    (SLICE / "slice.toml").write_text(
-        'name = "demo"\nversion = "0.1.0"\ndescription = "Demo."\nalias = "@demo"\ndependencies = []\n', encoding="utf-8")
+    dependencies = ", ".join(f'"@{d.name.removesuffix(".slice")}"' for d in REFERENCE)
+    (SLICE / "slice.toml").write_text('name = "demo"\nversion = "0.1.0"\ndescription = "Demo."\nalias = "@demo"\n'
+                                      f'dependencies = [{dependencies}]\n', encoding="utf-8")
     (WORK / "split.py").write_text(SPLITTER % {"gap": "split_gap" in MODES}, encoding="utf-8")
 
 
@@ -129,7 +135,13 @@ def extract(ident: str, earlier_calls: int) -> None:
         for name in ("Hero", "Broken", "Bare"):
             look_up(name)
     if ident == "0001":
-        card("story/hero", "Hero", "The hero of the story.")
+        known = [d for d in REFERENCE if (d / "people" / "hero.md").is_file()]
+        extends = f"@{known[0].name.removesuffix('.slice')}/people/hero" if known else ""
+        card("story/hero", "Hero", "The hero of the story.", extends=extends)
+        if "touch_reference" in MODES:
+            with open(REFERENCE[0] / "people" / "hero.md", "a", encoding="utf-8") as fh:
+                fh.write("- Added where it does not belong.\n")
+            (REFERENCE[0] / "people" / "new.md").write_text('+++\ntitle = "New"\n+++\n\nMisplaced.\n', encoding="utf-8")
         if "bad_card" in MODES:
             card("story/broken", "Broken", "A card with a broken lineage.", extends="story/nowhere")
         if "warn_card" in MODES:

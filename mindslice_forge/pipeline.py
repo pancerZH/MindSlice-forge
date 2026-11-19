@@ -3,6 +3,9 @@
 Every stage has the same shape: an agent session does the work, a check decides whether it is
 sound, and repair sessions fix what the check reports. A finished stage is committed in the
 workspace and recorded in ``state.json``, so running the same command again continues from there.
+
+With ``--into``, the build is for an existing workspace: it starts with read-only copies of what that
+workspace holds, so that sessions find and link to it, and a complete build is then added to it.
 """
 
 from __future__ import annotations
@@ -25,6 +28,9 @@ PROMPTS = Path(__file__).parent / "prompts"
 NO_PROMPT = "(none given: build a faithful, general-purpose knowledge base of the sources)"
 SPLIT_NEEDED = "The sources are too large to read in one session, so you must also write the splitter."
 SPLIT_NOT_NEEDED = "The sources fit in one session and will be read as a single chunk: do NOT write a splitter."
+REFERENCE_CHANGED = ("this file is part of the copy of the existing workspace, which the build must not change, "
+                     "and the forge has undone the change. If it added knowledge, put that in a card of your own "
+                     "slice instead, one that extends or links to the existing card")
 MAX_ISSUES_SHOWN = 50
 PROBE_TIMEOUT = 300  # seconds: the harness check is a task of a few tool calls
 
@@ -44,6 +50,12 @@ class Job:
     max_repairs: int = 2
     from_stage: str | None = None
     dry_run: bool = False
+    into: Path | None = None  # the existing workspace the result is for
+
+    @property
+    def reference(self) -> Path:
+        """With ``into``, where the copies of its slices are kept and mounted."""
+        return self.out / "reference"
 
     @property
     def work(self) -> Path:
@@ -75,6 +87,9 @@ def run(job: Job) -> None:
         log(f"Splitting: {'needed' if needs_split else 'not needed'} at {job.chunk_size} characters per chunk")
         log(f"An agent session must reach:\n{reach(job)}")
         log(f"Harness: {shlex.join(job.harness) if job.harness else '(no --harness-cmd given)'}")
+        if job.into:
+            log(f"Adds the result to: {job.into}, which mounts "
+                + ", ".join(m["alias"] for m in engine.mounts(job.into)))
         return
 
     engine.version()
@@ -94,15 +109,18 @@ def run(job: Job) -> None:
     if not state["finalized"]:
         finalize(job, state, len(chunks))
 
-    report = engine.validate(job.out)
+    report = validate(job)
     if report["errors"]:
         raise ForgeError("the finished workspace does not validate:\n" + format_issues(report["errors"]))
+    cards = sum(m.get("card_count", 0) for m in built(job).values())
     log(f"\nWorkspace ready: {job.out}")
-    log(f"  {report['stats']['cards']} cards, {len(state['chunks_done'])} of {len(chunks)} chunks processed, "
+    log(f"  {cards} cards, {len(state['chunks_done'])} of {len(chunks)} chunks processed, "
         f"{len(report['warnings'])} validation warning(s)")
     log(f"  Report: {job.work / 'report.md'}")
     log(f"  Per-chunk changes: git -C {job.out} log --stat")
-    log(f"  Next: mindslice -w {job.out} doctor")
+    if job.into:
+        connect(job, state, len(chunks))
+    log(f"  Next: mindslice -w {job.into if state.get('connected') else job.out} doctor")
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +132,7 @@ def start(job: Job, sources: list[profile.Source]) -> dict:
     """Load the state of an earlier run, or create the workspace for a new one."""
     files = [s.path for s in sources] + profile.collect(job.dicts)
     fingerprint = progress.fingerprint(files, job.prompt, job.chunk_size)
+    into = str(job.into) if job.into else None
     state = progress.load(job.state_file)
     if state is None:
         if job.from_stage:
@@ -122,9 +141,14 @@ def start(job: Job, sources: list[profile.Source]) -> dict:
             raise ForgeError(f"{job.out} already exists and was not created by the forge; choose another --output")
         job.work.mkdir(parents=True, exist_ok=True)
         engine.init(job.out)
+        if job.into:
+            copy_reference(job)
         checkpoint.init(job.out)
         checkpoint.commit(job.out, "empty workspace", tag="forge-init")
-        state = progress.new(fingerprint)
+        state = progress.new(fingerprint, into)
+    elif state.get("into") != into:
+        started = f"for {state['into']}" if state.get("into") else "without --into"
+        raise ForgeError(f"this build was started {started}; run it the same way, or choose another --output")
     elif job.from_stage:
         rewind(job, state)
         state["fingerprint"] = fingerprint
@@ -135,6 +159,21 @@ def start(job: Job, sources: list[profile.Source]) -> dict:
         checkpoint.rollback(job.out)  # drop whatever an interrupted session left behind
     progress.save(job.state_file, state)
     return state
+
+
+def copy_reference(job: Job) -> None:
+    """--into: copy what the existing workspace holds into the new one, mounted as it is there, so that the
+    build's sessions find, read and link to it without being able to change it. Taken once, at the start."""
+    for mount in engine.mounts(job.into):
+        source = (job.into / mount["path"]).resolve()
+        if not source.is_dir():
+            continue
+        if mount.get("kind") == "overlay":  # cards not yet in a slice: searched and read, never linked to
+            shutil.copytree(source, job.out / "overlay", dirs_exist_ok=True)
+            continue
+        copy = job.reference / (mount["alias"].removeprefix("@") + ".slice")
+        shutil.copytree(source, copy)
+        engine.mount(job.out, copy, mount["alias"], mount["precedence"], mount["role"])
 
 
 def rewind(job: Job, state: dict) -> None:
@@ -163,7 +202,7 @@ def plan(job: Job, state: dict, inventory: str, needs_split: bool) -> None:
     prompt = render("plan", profile=inventory, dicts=bullets(job.dicts), user_prompt=job.prompt or NO_PROMPT,
                     plan_file=job.work / "plan.md", slices_dir=job.out / "slices",
                     split_note=SPLIT_NEEDED if needs_split else SPLIT_NOT_NEEDED,
-                    split_file=job.work / "split.py", chunk_size=job.chunk_size)
+                    split_file=job.work / "split.py", chunk_size=job.chunk_size, existing=existing(job))
     run_step(job, "plan", prompt, lambda: check_plan(job, needs_split))
     aliases = engine.mount_slices(job.out)
     checkpoint.commit(job.out, "plan", tag="forge-plan")
@@ -181,9 +220,13 @@ def check_plan(job: Job, needs_split: bool) -> list[dict]:
     slices = sorted((job.out / "slices").glob("*.slice"))
     if not slices:
         issues.append(problem("no <name>.slice directory was created", job.out / "slices"))
+    taken = {m["alias"] for m in engine.mounts(job.out)}  # the overlay, and with --into the existing slices
     for directory in slices:
         if not has_text(directory / "slice.toml"):
             issues.append(problem("slice.toml is missing", directory / "slice.toml"))
+        elif (alias := engine.slice_alias(directory)) in taken:
+            issues.append(problem(f"the alias {alias} is taken: {', '.join(sorted(taken))} are mounted already. "
+                                  "Give this slice an alias of its own", directory / "slice.toml"))
         issues += engine.issues(engine.validate(job.out, directory))
     return issues
 
@@ -216,7 +259,8 @@ def extract(job: Job, state: dict, chunk: dict, position: str, previous: str | N
                     chunk_parts=parts_list(chunk), lookup=lookup_command(job),
                     position=position, out=job.out, slices_dir=job.out / "slices",
                     previous_handoff=handoff / f"{previous}.md" if previous else "(none: this is the first chunk)",
-                    handoff_file=handoff / f"{chunk['id']}.md", ledger_file=job.work / "ledger" / f"{chunk['id']}.md")
+                    handoff_file=handoff / f"{chunk['id']}.md", ledger_file=job.work / "ledger" / f"{chunk['id']}.md",
+                    existing=existing(job))
     run_step(job, step, prompt, lambda: check_chunk(job, chunk), check_lookups=True)
     checkpoint.commit(job.out, f"chunk {chunk['id']}: {title}")
     state["chunks_done"].append(chunk["id"])
@@ -227,7 +271,7 @@ def extract(job: Job, state: dict, chunk: dict, position: str, previous: str | N
 def check_chunk(job: Job, chunk: dict) -> list[dict]:
     notes = [job.work / "ledger" / f"{chunk['id']}.md", job.work / "handoff" / f"{chunk['id']}.md"]
     issues = [problem(f"{path.parent.name}/{path.name} was not written", path) for path in notes if not has_text(path)]
-    return issues + engine.issues(engine.validate(job.out), checkpoint.changed(job.out))
+    return issues + engine.issues(validate(job), checkpoint.changed(job.out))
 
 
 def not_looked_up(job: Job, queries: list[str]) -> list[dict]:
@@ -239,7 +283,8 @@ def not_looked_up(job: Job, queries: list[str]) -> list[dict]:
     return [{"severity": "error", "code": "not_looked_up", "file": str(card),
              "message": "this card was created without looking up its title or an alias. Look it up now, with the "
                         f"command {lookup_command(job)}; if the workspace already has a card for the same thing, "
-                        "merge the two into the one that existed first"}
+                        "merge the two into the one that existed first (a read-only card stays as it is: "
+                        "then yours extends it and keeps only what is new)"}
             for card in new_cards if not lookup.covered(engine.card_names(card), queries)]
 
 
@@ -251,7 +296,7 @@ def finalize(job: Job, state: dict, total: int) -> None:
                     out=job.out, lookup=lookup_command(job), slices_dir=job.out / "slices", ledger_dir=job.work / "ledger",
                     report_file=job.work / "report.md", coverage=coverage,
                     profile_file=job.work / "profile.md", manifest_file=job.chunks / "manifest.json",
-                    issues=format_issues(engine.issues(engine.validate(job.out))) or "(none)")
+                    issues=format_issues(engine.issues(validate(job))) or "(none)", existing=existing(job))
     run_step(job, "finalize", prompt, lambda: check_final(job), check_lookups=True)
     checkpoint.commit(job.out, "finalize")
     state["finalized"] = True
@@ -261,7 +306,40 @@ def finalize(job: Job, state: dict, total: int) -> None:
 def check_final(job: Job) -> list[dict]:
     required = [d / "overview.md" for d in sorted((job.out / "slices").glob("*.slice"))] + [job.work / "report.md"]
     issues = [problem(f"{path.name} was not written", path) for path in required if not has_text(path)]
-    return issues + engine.issues(engine.validate(job.out))
+    return issues + engine.issues(validate(job))
+
+
+def connect(job: Job, state: dict, total: int) -> None:
+    """--into: copy the slices of a complete build into the existing workspace and mount them there.
+    An alias that is mounted there already is never replaced."""
+    if state.get("connected"):
+        return
+    if len(state["chunks_done"]) < total:
+        log(f"  Not added to {job.into}: {len(state['chunks_done'])} of {total} chunks are processed. "
+            "Run without --sample to finish the build, and it is added then.")
+        return
+    slices = built(job)
+    clash = sorted(set(slices) & {m["alias"] for m in engine.mounts(job.into)})
+    if clash:
+        raise ForgeError(f"{', '.join(clash)} is mounted in {job.into} already, and the forge does not replace a mount. "
+                         f"If it is an earlier version of this build, unmount it (`mindslice -w {job.into} unmount "
+                         f"{clash[0]}`) and run the same command again.")
+    (job.into / "slices").mkdir(exist_ok=True)
+    copies = []
+    for alias, mount in slices.items():
+        source = (job.out / mount["path"]).resolve()
+        copies.append(copy := free_path(job.into / "slices", source.name))
+        shutil.copytree(source, copy)
+        engine.mount(job.into, copy)
+        log(f"  Added {alias} to {job.into}: {copy}")
+    state["connected"] = True
+    progress.save(job.state_file, state)
+    report = engine.validate(job.into)
+    problems = [issue for issue in report["errors"] + report["warnings"]
+                if issue.get("address", "").split("/")[0] in slices
+                or any(copy in Path(issue.get("file", "/")).parents for copy in copies)]
+    if problems:
+        log(f"  {len(problems)} problem(s) in {job.into} concern the new slices:\n{format_issues(problems)}")
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +361,7 @@ def run_step(job: Job, step: str, prompt: str, check: Check, *, check_lookups: b
         time.sleep(delay)
 
     def checked() -> list[dict]:
-        issues = check()
+        issues = check() + reference_changes(job)
         if check_lookups:
             issues += not_looked_up(job, lookup.queries(job.out)[earlier:])
         return issues
@@ -319,6 +397,13 @@ def session(job: Job, name: str, prompt: str) -> bool:
     cmd = harness.command(job.harness, prompt_file, job.work)
     checkpoint.begin(job.out)
     return harness.run(cmd, job.work, job.work / "logs" / f"{name}.log", job.timeout)
+
+
+def reference_changes(job: Job) -> list[dict]:
+    """--into: the copies of the existing workspace are read-only. A change to them is undone and reported."""
+    if not job.reference.is_dir():
+        return []
+    return [problem(REFERENCE_CHANGED, job.out / name) for name in checkpoint.restore(job.out, job.reference.name)]
 
 
 def check_harness(job: Job) -> None:
@@ -379,6 +464,47 @@ def render(name: str, **values: object) -> str:
     values.setdefault("card_format", (PROMPTS / "card-format.md").read_text(encoding="utf-8"))
     template = (PROMPTS / f"{name}.md").read_text(encoding="utf-8")
     return re.sub(r"\{\{(\w+)\}\}", lambda match: str(values[match.group(1)]), template)
+
+
+def built(job: Job) -> dict[str, dict]:
+    """The slices of this build that are mounted in its workspace, by alias."""
+    slices = job.out / "slices"
+    return {m["alias"]: m for m in engine.mounts(job.out) if slices in (job.out / m["path"]).resolve().parents}
+
+
+def validate(job: Job) -> dict:
+    """The engine's report on the slices this build makes. The other mounts (the overlay, and with --into the
+    copies of the existing workspace) are not the build's to fix, so their issues are left out."""
+    report = engine.validate(job.out)
+    theirs = {m["alias"] for m in engine.mounts(job.out)} - set(built(job))
+
+    def ours(issue: dict) -> bool:
+        file = Path(issue.get("file") or job.out)
+        return issue.get("address", "").split("/")[0] not in theirs and job.reference not in file.parents
+
+    return {**report, "errors": list(filter(ours, report["errors"])), "warnings": list(filter(ours, report["warnings"]))}
+
+
+def existing(job: Job) -> str:
+    """The prompt section on the existing workspace of --into, or nothing."""
+    if not job.into:
+        return ""
+    mounts = engine.mounts(job.out)
+    slices = [m for m in mounts if job.reference in (job.out / m["path"]).resolve().parents]
+    listing = "\n".join(f"- `{m['alias']}`, {m.get('card_count', '?')} cards: `{(job.out / m['path']).resolve()}`"
+                        for m in slices)
+    overlay = sum(m.get("card_count", 0) for m in mounts if m.get("kind") == "overlay")
+    return render("existing", into=job.into, out=job.out, reference=listing or "(none: it holds no slices yet)",
+                  overlay_cards=overlay, reference_dir=job.reference).strip()
+
+
+def free_path(directory: Path, name: str) -> Path:
+    """``directory/name``, or, as bake names versions, the first free ``<stem>-2.slice``, ``<stem>-3.slice``, ..."""
+    stem, path, number = name.removesuffix(".slice"), directory / name, 1
+    while path.exists():
+        number += 1
+        path = directory / f"{stem}-{number}.slice"
+    return path
 
 
 def problem(message: str, file: Path) -> dict:

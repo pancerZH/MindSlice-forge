@@ -203,17 +203,27 @@ class StateTest(TempDirTest):
         self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), ["state.json"])
 
     def test_rewind_forgets_the_stage_and_everything_after_it(self):
-        done = {"fingerprint": "x", "plan": True, "split": True, "chunks_done": ["0001"], "finalized": True}
+        done = {"fingerprint": "x", "plan": True, "split": True, "chunks_done": ["0001"], "finalized": True,
+                "connected": True}
         expected = {
-            "plan": {"plan": False, "split": False, "chunks_done": [], "finalized": False},
-            "split": {"plan": True, "split": False, "chunks_done": [], "finalized": False},
-            "extract": {"plan": True, "split": True, "chunks_done": [], "finalized": False},
-            "finalize": {"plan": True, "split": True, "chunks_done": ["0001"], "finalized": False},
+            "plan": {"plan": False, "split": False, "chunks_done": [], "finalized": False, "connected": False},
+            "split": {"plan": True, "split": False, "chunks_done": [], "finalized": False, "connected": False},
+            "extract": {"plan": True, "split": True, "chunks_done": [], "finalized": False, "connected": False},
+            "finalize": {"plan": True, "split": True, "chunks_done": ["0001"], "finalized": False, "connected": False},
         }
         for stage, after in expected.items():
             data = json.loads(json.dumps(done))
             state.rewind(data, stage)
             self.assertEqual(data, {"fingerprint": "x", **after}, stage)
+
+
+class SliceAliasTest(TempDirTest):
+    def test_alias_from_slice_toml_or_else_the_directory_name(self):
+        self.write("a.slice/slice.toml", 'name = "a"\nalias = "lore"\n')
+        self.write("b.slice/slice.toml", 'name = "b"\nalias = "@notes"\n')
+        self.write("c.slice/slice.toml", "not toml at all = = =\n")
+        self.assertEqual([engine.slice_alias(self.tmp / n) for n in ("a.slice", "b.slice", "c.slice", "d.slice")],
+                         ["@lore", "@notes", "@c", "@d"])
 
 
 class EngineIssuesTest(unittest.TestCase):
@@ -378,11 +388,12 @@ class HarnessTest(TempDirTest):
 
 class PipelineHelpersTest(TempDirTest):
     VALUES = {
-        "plan": ["profile", "dicts", "user_prompt", "plan_file", "slices_dir", "split_note", "split_file", "chunk_size"],
+        "plan": ["profile", "dicts", "user_prompt", "plan_file", "slices_dir", "split_note", "split_file", "chunk_size",
+                 "existing"],
         "extract": ["plan_file", "user_prompt", "dicts", "chunk_file", "chunk_title", "chunk_parts", "lookup", "position", "out",
-                    "slices_dir", "previous_handoff", "handoff_file", "ledger_file"],
+                    "slices_dir", "previous_handoff", "handoff_file", "ledger_file", "existing"],
         "finalize": ["plan_file", "user_prompt", "out", "slices_dir", "ledger_dir", "report_file", "coverage", "issues",
-                     "profile_file", "manifest_file", "lookup"],
+                     "profile_file", "manifest_file", "lookup", "existing"],
         "repair": ["task_file", "issues"],
     }
 
@@ -398,6 +409,20 @@ class PipelineHelpersTest(TempDirTest):
         for name in ("plan", "extract", "finalize"):  # a repair session reads its task's prompt for the rules
             text = " ".join(pipeline.render(name, **{key: "x" for key in self.VALUES[name]}).split())
             self.assertIn("belongs to the user's other work: do not search it, read it or write to it", text, name)
+
+    def test_existing_workspace_section_renders_with_the_values_the_pipeline_passes(self):
+        keys = ["into", "out", "reference", "overlay_cards", "reference_dir"]
+        text = pipeline.render("existing", **{key: f"<<{key}>>" for key in keys})
+        self.assertNotIn("{{", text)
+        for key in keys:
+            self.assertIn(f"<<{key}>>", text)
+        self.assertIn("read-only", text)
+
+    def test_free_path_follows_the_names_bake_gives_versions(self):
+        self.assertEqual(pipeline.free_path(self.tmp, "demo.slice"), self.tmp / "demo.slice")
+        (self.tmp / "demo.slice").mkdir()
+        (self.tmp / "demo-2.slice").mkdir()
+        self.assertEqual(pipeline.free_path(self.tmp, "demo.slice"), self.tmp / "demo-3.slice")
 
     def test_rendered_values_are_not_expanded_again(self):
         text = pipeline.render("repair", task_file="t", issues="a {{task_file}} in a card")
@@ -480,6 +505,15 @@ class CliTest(TempDirTest):
         self.assertEqual((job.sources, job.dicts, job.out), ([source.parent], [frame], self.tmp / "ws"))
         self.assertEqual((job.prompt, job.sample, job.chunk_size, job.from_stage), ("p", 2, 500, "extract"))
         self.assertEqual((job.max_repairs, job.timeout, job.dry_run), (0, 60, True))
+
+    def test_into_must_be_an_existing_workspace_other_than_the_output(self):
+        source = self.write("a.txt", "x\n")
+        with self.assertRaisesRegex(ForgeError, "has no mounts.toml"):
+            self.job(source, "--into", self.tmp / "nowhere")
+        self.write("memory/mounts.toml", "")
+        self.assertEqual(self.job(source, "--into", self.tmp / "memory").into, self.tmp / "memory")
+        with self.assertRaisesRegex(ForgeError, "must differ"):
+            self.job(source, "--into", self.tmp / "memory", "-o", self.tmp / "memory")
 
     def test_harness_command_is_needed_for_everything_except_a_dry_run(self):
         source = str(self.write("a.txt", "x\n"))

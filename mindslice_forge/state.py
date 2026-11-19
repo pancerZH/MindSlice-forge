@@ -18,8 +18,10 @@ def fingerprint(files: list[Path], prompt: str, chunk_size: int) -> str:
     return digest.hexdigest()
 
 
-def new(fingerprint: str) -> dict:
-    return {"fingerprint": fingerprint, "plan": False, "split": False, "chunks_done": [], "finalized": False}
+def new(fingerprint: str, into: str | None = None) -> dict:
+    """``into``: the existing workspace the result is for (``--into``); ``connected``: whether it was added there."""
+    return {"fingerprint": fingerprint, "into": into, "plan": False, "split": False, "chunks_done": [],
+            "finalized": False, "connected": False}
 
 
 def load(path: Path) -> dict | None:
@@ -42,3 +44,4 @@ def rewind(state: dict, stage: str) -> None:
     if "extract" in redo:
         state["chunks_done"] = []
     state["finalized"] = False
+    state["connected"] = False

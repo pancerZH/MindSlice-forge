@@ -48,6 +48,8 @@ The user's conversion instructions:
    you repaired; problems that remain; and 2 or 3 questions the user can try first, with the
    expected answer and the card that holds it.
 
+{{existing}}
+
 ## Rules
 
 - Write only inside the slice directories under `{{slices_dir}}`, plus the report. Do not create

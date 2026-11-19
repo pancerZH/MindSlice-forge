@@ -16,7 +16,9 @@ Fix every one of them, and nothing else.
 - For `not_looked_up`, run the recorded lookup command in the issue with the card's title or an
   alias. Read the matching cards, ignoring the new card's own search hit. If an older card covers
   the same thing and scope, merge the new facts and aliases into it, repoint links, and remove
-  the duplicate. Keep distinct periods or scopes separate as the plan requires. A successful
+  the duplicate; if that older card is read-only (the task says which are), keep the new card
+  with only what the older one lacks, and make it extend or link to the older one. Keep distinct
+  periods or scopes separate as the plan requires. A successful
   search with no existing match permits keeping the new card. Do not rename a card merely to
   match an unrelated lookup. Any new cards you create while repairing need lookups too.
 - A problem in a program is fixed in the program. Do not hand-edit its output.

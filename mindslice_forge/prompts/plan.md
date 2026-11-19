@@ -32,6 +32,8 @@ The user's conversion instructions:
 
 > {{user_prompt}}
 
+{{existing}}
+
 ## What to do
 
 1. **Study the sources with shell tools.** Look at how they are organized: heading and chapter

@@ -51,11 +51,33 @@ def init(out: Path) -> None:
     _call("init", str(out))
 
 
+def mounts(workspace: Path) -> list[dict]:
+    """The mount table of a workspace, the overlay included; ``path`` is relative to the workspace or absolute."""
+    return _call("-w", str(workspace), "status")["mounts"]
+
+
+def mount(workspace: Path, directory: Path, alias: str | None = None, precedence: int = 50,
+          role: str = "curated") -> str:
+    """Mount ``directory`` read-only and return its alias. The workspace's overlay is left as it is."""
+    args = ["-w", str(workspace), "mount", str(directory), "--precedence", str(precedence), "--role", role,
+            "--keep-overlay", *(["--alias", alias] if alias else [])]
+    return _call(*args)["alias"]
+
+
 def mount_slices(out: Path) -> list[str]:
     """Mount every ``slices/*.slice`` directory that is not mounted yet; returns the new aliases."""
-    mounted = {(out / m["path"]).resolve() for m in _call("-w", str(out), "status")["mounts"]}
-    new = [d for d in sorted((out / "slices").glob("*.slice")) if d.resolve() not in mounted]
-    return [_call("-w", str(out), "mount", str(d), "--precedence", "50", "--role", "curated")["alias"] for d in new]
+    mounted = {(out / m["path"]).resolve() for m in mounts(out)}
+    return [mount(out, d) for d in sorted((out / "slices").glob("*.slice")) if d.resolve() not in mounted]
+
+
+def slice_alias(directory: Path) -> str:
+    """The alias a slice directory is mounted under: the one in its ``slice.toml``, or else its name."""
+    try:
+        alias = tomllib.loads((directory / "slice.toml").read_text(encoding="utf-8")).get("alias")
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        alias = None
+    name = alias.strip() if isinstance(alias, str) and alias.strip() else directory.name.removesuffix(".slice")
+    return "@" + name.removeprefix("@")
 
 
 def validate(out: Path, slice_dir: Path | None = None) -> dict:

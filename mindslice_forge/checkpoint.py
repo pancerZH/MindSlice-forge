@@ -75,6 +75,16 @@ def rollback(out: Path, ref: str = "HEAD") -> None:
         (out / name).mkdir(exist_ok=True)
 
 
+def restore(out: Path, name: str) -> list[str]:
+    """Undo every change below the directory ``name`` since the last commit; returns the paths that had changed."""
+    entries = git(out, "status", "--porcelain", "-z", "--untracked-files=all", "--", name).split("\0")
+    changed = [entry[3:] for entry in entries if entry]
+    if changed:
+        git(out, "checkout", "-q", "HEAD", "--", name)
+        git(out, "clean", "-fdq", "--", name)
+    return changed
+
+
 def changed(out: Path) -> set[Path]:
     """Files created or modified since the last commit."""
     return _diff(out) | _untracked(out)

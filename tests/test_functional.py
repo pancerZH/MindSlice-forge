@@ -65,10 +65,37 @@ class FunctionalTest(unittest.TestCase):
     def state(self):
         return json.loads((self.work / "state.json").read_text(encoding="utf-8"))
 
-    def mindslice(self, *args):
-        done = subprocess.run(["mindslice", "-w", str(self.out), *args, "--json"], capture_output=True, text=True,
-                              encoding="utf-8")
+    def mindslice(self, *args, workspace=None):
+        done = subprocess.run(["mindslice", "-w", str(workspace or self.out), *args, "--json"], capture_output=True,
+                              text=True, encoding="utf-8")
         return json.loads(done.stdout)
+
+    def mounted(self, workspace):
+        return {m["alias"]: m["path"] for m in self.mindslice("status", workspace=workspace)["mounts"]}
+
+    def target(self, alias="@lore"):
+        """An existing workspace: a mounted slice with a card the sources also speak of and a problem of its own,
+        and a recent card in its overlay."""
+        target = self.tmp / "memory"
+        subprocess.run(["mindslice", "init", str(target)], check=True, capture_output=True)
+        lore = target / "slices" / "lore.slice"
+        (lore / "people").mkdir(parents=True)
+        (lore / "slice.toml").write_text(f'name = "lore"\nversion = "0.1.0"\ndescription = "Lore."\nalias = "{alias}"\n'
+                                         'dependencies = []\n', encoding="utf-8")
+        (lore / "people" / "hero.md").write_text('+++\ntitle = "Hero"\n+++\n\nThe hero, as known before.\n\n- Known.\n',
+                                                 encoding="utf-8")
+        (lore / "people" / "old.md").write_text('+++\ntitle = "Old"\nextends = ["people/nowhere"]\n+++\n\n'
+                                                'A problem of the existing workspace.\n\n- Old.\n', encoding="utf-8")
+        subprocess.run(["mindslice", "-w", str(target), "mount", str(lore), "--role", "baseline"], check=True,
+                       capture_output=True)
+        subprocess.run(["mindslice", "-w", str(target), "write", "notes/recent", "--title", "Recent", "--summary",
+                        "A recent note.", "--content", "Learned lately.", "--no-stage"], check=True, capture_output=True)
+        return target
+
+    def kept(self, target):
+        """The existing workspace's own memory, which a build must leave as it is."""
+        return {path.relative_to(target).as_posix(): path.read_bytes() for name in ("slices/lore.slice", "overlay")
+                for path in (target / name).rglob("*") if path.is_file()}
 
     def write_memory(self, card, *options):
         """Write a card the way an agent connected to the workspace does."""
@@ -367,6 +394,98 @@ class FunctionalTest(unittest.TestCase):
             self.assertEqual((self.out / "mounts.toml").read_text(encoding="utf-8"), mounts)
             self.assertTrue((baked[0] / "story/hero-note.md").is_file())
             self.assertEqual(self.state()["chunks_done"], ["0001"])
+
+    # -- --into: a build for an existing workspace ---------------------------
+
+    def test_build_into_an_existing_workspace_sees_it_and_is_added_to_it(self):
+        target = self.target()
+        memory = self.kept(target)
+        code, out, err = self.forge(*NOVEL_ARGS, "--into", target)
+        self.assertEqual(code, 0, err)
+        # The existing workspace's own problem is not the build's to fix: no repair session.
+        self.assertEqual(self.calls(), ["plan", "extract-0001", "extract-0002", "extract-0003", "finalize"])
+        # Sessions work with a copy of it, and are told so.
+        self.assertEqual(self.mounted(self.out)["@lore"], "./reference/lore.slice")
+        self.assertTrue((self.out / "overlay/notes/recent.md").is_file())
+        hits = self.mindslice("search", "Hero")["results"]
+        self.assertIn("@lore/people/hero", [hit["address"] for hit in hits])
+        for step in ("plan", "extract-0002", "finalize"):
+            self.assertIn("## The existing workspace", self.prompt(step))
+            self.assertIn(f"`@lore`, 2 cards: `{self.out / 'reference/lore.slice'}`", self.prompt(step))
+            self.assertIn("1 recent card(s)", self.prompt(step))
+        # The finished slice is copied into the existing workspace, mounted, and extends what was there.
+        self.assertEqual(self.mounted(target)["@demo"], "./slices/demo.slice")
+        self.assertIn(f"Added @demo to {target}", out)
+        self.assertIn(f"mindslice -w {target} doctor", out)
+        self.assertIn("@lore/people/hero", json.dumps(self.mindslice("read", "@demo/story/hero", workspace=target)))
+        report = self.mindslice("validate", workspace=target)
+        self.assertEqual([i for i in report["errors"] + report["warnings"] if i.get("address", "").startswith("@demo")], [])
+        self.assertEqual(self.kept(target), memory)
+        # Running again changes nothing.
+        self.forget_calls()
+        self.assertEqual(self.forge(*NOVEL_ARGS, "--into", target)[0], 0)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((target / "slices/demo-2.slice").exists())
+
+    def test_sample_build_is_added_only_when_complete(self):
+        target = self.target()
+        code, out, err = self.forge(*NOVEL_ARGS, "--sample", "1", "--into", target)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"Not added to {target}: 1 of 3 chunks", out)
+        self.assertNotIn("@demo", self.mounted(target))
+        code, out, err = self.forge(*NOVEL_ARGS, "--into", target)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.mounted(target)["@demo"], "./slices/demo.slice")
+
+    def test_change_to_the_copy_of_the_existing_workspace_is_undone_and_sent_back(self):
+        target = self.target()
+        code, _, err = self.forge(*NOVEL_ARGS, "--sample", "1", "--into", target, modes="touch_reference")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls(), ["plan", "extract-0001", "extract-0001.repair1", "finalize"])
+        repair = self.prompt("extract-0001.repair1")
+        self.assertIn("copy of the existing workspace", repair)
+        for name in ("hero.md", "new.md"):
+            self.assertIn(str(self.out / "reference/lore.slice/people" / name), repair)
+        self.assertEqual((self.out / "reference/lore.slice/people/hero.md").read_bytes(),
+                         (target / "slices/lore.slice/people/hero.md").read_bytes())
+        self.assertFalse((self.out / "reference/lore.slice/people/new.md").exists())
+        self.assertEqual(checkpoint.git(self.out, "status", "--porcelain"), "")
+
+    def test_alias_the_existing_workspace_uses_is_sent_back(self):
+        target = self.target(alias="@demo")
+        code, _, err = self.forge(*NOVEL_ARGS, "--into", target)
+        self.assertEqual(code, 1)
+        self.assertIn("the alias @demo is taken", err)
+        self.assertEqual(self.calls(), ["plan", "plan.repair1", "plan.repair2"])
+
+    def test_rebuild_is_added_again_only_after_the_earlier_one_is_unmounted(self):
+        target = self.target()
+        self.assertEqual(self.forge(*NOVEL_ARGS, "--into", target)[0], 0)
+        code, _, err = self.forge(*NOVEL_ARGS, "--into", target, "--from", "finalize")
+        self.assertEqual(code, 1)
+        self.assertIn(f"@demo is mounted in {target} already", err)
+        self.assertIn(f"mindslice -w {target} unmount @demo", err)
+        subprocess.run(["mindslice", "-w", str(target), "unmount", "@demo"], check=True, capture_output=True)
+        code, _, err = self.forge(*NOVEL_ARGS, "--into", target)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.mounted(target)["@demo"], "./slices/demo-2.slice")
+
+    def test_build_continues_only_with_the_into_it_was_started_with(self):
+        target = self.target()
+        self.assertEqual(self.forge(*NOVEL_ARGS, "--sample", "1")[0], 0)
+        code, _, err = self.forge(*NOVEL_ARGS, "--into", target)
+        self.assertEqual(code, 1)
+        self.assertIn("started without --into", err)
+        self.assertNotIn("@demo", self.mounted(target))
+
+    def test_dry_run_names_the_existing_workspace_and_changes_nothing(self):
+        target = self.target()
+        memory = self.kept(target)
+        code, out, err = self.forge(*NOVEL_ARGS, "--dry-run", "--into", target)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"Adds the result to: {target}, which mounts @overlay, @lore", out)
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.kept(target), memory)
 
     def test_workspace_without_its_checkpoints_is_not_rolled_back(self):
         self.assertEqual(self.forge(*NOVEL_ARGS, "--sample", "1")[0], 0)

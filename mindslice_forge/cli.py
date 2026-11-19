@@ -24,6 +24,9 @@ def parser() -> argparse.ArgumentParser:
                    help="conversion instructions, or a file that holds them")
     p.add_argument("-o", "--output", type=Path, metavar="DIR",
                    help="workspace to create (default: ./<first source name>.workspace)")
+    p.add_argument("--into", type=Path, metavar="WORKSPACE",
+                   help="an existing MindSlice workspace to add the result to: the build sees what it holds and "
+                        "does not repeat it, and the finished slices are copied there and mounted")
     p.add_argument("--sample", type=int, metavar="N", help="process only the first N chunks")
     p.add_argument("--chunk-size", type=int, default=100_000, metavar="CHARS",
                    help="target characters per chunk (default: %(default)s)")
@@ -62,6 +65,11 @@ def job_from(args: argparse.Namespace) -> pipeline.Job:
     dicts = [p.resolve() for p in args.dicts]
     first = sources[0]
     out = (args.output or Path(f"{first.name if first.is_dir() else first.stem}.workspace")).resolve()
+    into = args.into.expanduser().resolve() if args.into else None
+    if into and not (into / "mounts.toml").is_file():
+        raise ForgeError(f"--into needs an existing MindSlice workspace, and {into} has no mounts.toml")
+    if into == out:
+        raise ForgeError("--into names the workspace to add to, and -o the build's own: they must differ")
     if not args.harness_cmd and not args.dry_run:
         raise ForgeError("--harness-cmd is needed: the command line that runs one agent session of your harness. "
                          "`mindslice-forge --help` says what it must do; --dry-run works without it.")
@@ -69,7 +77,7 @@ def job_from(args: argparse.Namespace) -> pipeline.Job:
         sources=sources, dicts=dicts, prompt=read_prompt(args.prompt), out=out,
         harness=harness.template(args.harness_cmd) if args.harness_cmd else [],
         sample=args.sample, chunk_size=args.chunk_size, timeout=args.timeout, max_repairs=args.max_repairs,
-        from_stage=args.from_stage, dry_run=args.dry_run)
+        from_stage=args.from_stage, dry_run=args.dry_run, into=into)
 
 
 def main(argv: list[str] | None = None) -> int:

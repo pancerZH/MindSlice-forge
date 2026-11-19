@@ -60,6 +60,7 @@ mindslice-forge novel.txt \
 | `--dict PATH` | A reference frame: an outline, glossary or encyclopedia page about the sources. It shapes names and structure and is never a source of facts. Repeatable. |
 | `--prompt TEXT_OR_FILE` | What to extract and how. |
 | `-o, --output DIR` | The workspace to create. Default: `./<first source name>.workspace`. |
+| `--into WORKSPACE` | An existing MindSlice workspace to add the result to; see [Add to an existing workspace](#add-to-an-existing-workspace). |
 | `--sample N` | Process only the first N chunks, to try a prompt before a long run. |
 | `--chunk-size CHARS` | Target size of a chunk. Default 100000 characters. |
 | `--harness-cmd COMMAND` | The command line that runs one agent session; see [The harness command](#the-harness-command). Needed for everything except `--dry-run`. |
@@ -171,6 +172,7 @@ end of the step; deciding whether two cards describe the same thing remains the 
 novel.workspace/            a MindSlice workspace, ready for `mindslice -w novel.workspace ...`
 ├── mounts.toml, overlay/, staging/
 ├── slices/<name>.slice/    the cards, mounted
+├── reference/              with --into: the read-only copy of the existing workspace's slices
 └── .git/                   one commit per finished chunk: the checkpoints (slices and mounts only)
 novel.workspace.forge/      build state and evidence; keep it for resume and review
 ├── state.json, harness.json  progress, and the harness command that passed its check
@@ -199,10 +201,11 @@ touches it. If the slices or the mount table were changed outside the forge, by 
 them; build into another output and mount its slices. Do not bake or change mounts while a build
 is running.
 
-**For an existing workspace**, build into a separate new directory. Forge cannot take over a
-nonempty workspace that it did not create. Inspect the resulting `slices/*.slice` aliases and
-dependencies, then mount the selected individual slices. For example, if the build produced
-`handbook.slice` and its alias is available in your destination:
+**For an existing workspace**, use `--into`, described in the next section. To do it by hand
+instead, build into a separate new directory (Forge cannot take over a nonempty workspace that it
+did not create), inspect the resulting `slices/*.slice` aliases and dependencies, then mount the
+selected individual slices. For example, if the build produced `handbook.slice` and its alias is
+available in your destination:
 
 ```bash
 mindslice -w ~/mindslice mount /path/to/build.workspace/slices/handbook.slice \
@@ -223,6 +226,42 @@ Validation checks structure, and recorded lookups check search coverage. Neither
 the model preserved every fact. Treat input coverage, retrieval and source fidelity as separate
 checks; a sampled build remains partial after it is connected to an agent.
 
+## Add to an existing workspace
+
+```bash
+mindslice-forge paper.md notes/ --into ~/mindslice --harness-cmd "$HARNESS" \
+    --prompt "Methods, results and open questions of the paper, for later research sessions."
+```
+
+With `--into`, the result is new slices for a workspace that already holds knowledge, such as the
+memory your agent uses every day. The build still happens in its own output (`-o`, by default
+`./<first source name>.workspace`), with the checkpoints, resume and rollback described above;
+the existing workspace is changed once, at the end.
+
+- **The build sees what is there.** When it starts, the forge copies the existing workspace's
+  slices into `<output>/reference/` and mounts them under the same aliases, and copies its
+  overlay. Searches, reads and the lookup check cover them, so sessions write only what the
+  sources add: a card that `extends` an existing one, or a link `[[@alias/path]]` to it, and
+  `dependencies` in `slice.toml` for the slices linked to. The copy is taken once; later changes
+  to the existing workspace are not seen by this build.
+- **The copy is read-only.** A session that changes a file under `reference/` has the change
+  undone and is sent back to put the knowledge in its own slice. Issues the engine reports on the
+  copy are not the build's to fix and do not stop it.
+- **New aliases.** The plan must give each new slice an alias the existing workspace does not
+  use; a clash is sent back for repair.
+- **Added when complete.** After the last chunk and the finalize step, the forge copies each new
+  slice into the existing workspace's `slices/` (as `<name>.slice`, or `<name>-2.slice` and so
+  on if that name is taken), mounts it there with precedence 50 and role `curated`, leaving the
+  overlay as it is, and reports the issues `mindslice validate` finds on the new slices. A
+  `--sample` build that has not reached the last chunk is not added; run without `--sample` to
+  finish it.
+- **Nothing is replaced.** Running the same command again after the result was added does
+  nothing. After a rebuild (`--from`), the forge stops if the alias is still mounted in the
+  existing workspace and says how to unmount the earlier version; run the same command again
+  then.
+- A build started with `--into` continues only with the same `--into`, and one started without
+  it only without.
+
 ## Safety
 
 - Select allowed sources before invoking Forge, including `--dry-run`: recursive scanning does
@@ -237,7 +276,11 @@ checks; a sampled build remains partial after it is connected to an agent.
   none of it: it works through files and the `mindslice` command in its own output. To keep your
   memory out of a build's reach, add to the harness command the options that leave that
   configuration out, taken from your harness's own help.
-- Forge writes its output workspace and sibling `.forge/` directory. It refuses to take over an
+- With `--into`, the existing workspace's slices and overlay are copied into the build, and every
+  build session can read them: all of that memory reaches the harness and its model. Use a
+  workspace whose whole content you are willing to share with them.
+- Forge writes its output workspace and sibling `.forge/` directory, and with `--into` it adds
+  the finished slices to that workspace. It refuses to take over an
   existing nonempty output it did not create. Rollbacks happen inside its output directory and
   cover the slices and the mount table only, never `overlay/`, `staging/` or `.history/`.
 

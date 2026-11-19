@@ -72,6 +72,8 @@ Reference frame (the "dict"), for names and structure only, never as a source of
   cards with `[[path]]`, and only to cards that exist.
 - A chunk that holds nothing in scope is a valid result: write no cards, and say so in the ledger.
 
+{{existing}}
+
 ## Where to write
 
 - Cards: only inside the slice directories under `{{slices_dir}}`, as files you create or edit
