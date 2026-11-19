@@ -13,7 +13,7 @@ from . import ForgeError
 # Warnings an agent can fix in the card they are reported on. Others are left for the final report.
 FIXABLE = {"card_too_long", "missing_summary", "long_summary", "missing_title", "missing_frontmatter",
            "broken_wikilink", "frontmatter_schema"}
-MINIMUM = (0, 1, 0)  # the oldest engine with the commands, JSON output and card format this forge relies on
+MINIMUM = (0, 2, 5)  # older engines are not supported (single user, no compatibility kept)
 
 
 def _engine(*args: str) -> subprocess.CompletedProcess:

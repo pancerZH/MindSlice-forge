@@ -12,7 +12,7 @@ The forge itself is small on purpose. It keeps the inventory, the state, the che
 checks; everything that needs understanding of the text is done by the agent, following the
 templates in [`mindslice_forge/prompts/`](https://github.com/pancerZH/MindSlice-forge/tree/main/mindslice_forge/prompts).
 
-Python 3.12+, standard library only. Needs `mindslice` 0.1.0 or newer, `git`, and an agent harness
+Python 3.12+, standard library only. Needs `mindslice` 0.2.5 or newer, `git`, and an agent harness
 that can run a session unattended from the command line.
 
 ## When to use Forge
