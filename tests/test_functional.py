@@ -258,6 +258,24 @@ class FunctionalTest(unittest.TestCase):
         # A lookup made for an earlier chunk does not excuse a card created in a later one.
         self.assertIn("story/hero-part-0002.md", self.prompt("extract-0002.repair1"))
 
+    def test_changes_outside_the_planned_slices_are_undone_or_sent_back(self):
+        code, _, err = self.forge(*NOVEL_ARGS, "--sample", "1", modes="touch_plan,engine_write")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls(), ["plan", "extract-0001", "extract-0001.repair1", "finalize"])
+        repair = self.prompt("extract-0001.repair1")
+        self.assertIn(f"{self.out / 'slices/demo.slice/slice.toml'}: a step that writes cards", repair)
+        self.assertIn(f"{self.out / 'slices/extra.slice/side.md'}: cards go only into the slices of the plan", repair)
+        self.assertIn(f"{self.out / 'overlay/story/side.md'}: this card was written with `mindslice write`", repair)
+        self.assertNotIn("changed by the session", (self.out / "slices/demo.slice/slice.toml").read_text(encoding="utf-8"))
+        self.assertEqual(checkpoint.git(self.out, "status", "--porcelain"), "")
+
+    def test_a_commit_by_the_session_is_undone_and_its_work_still_checked(self):
+        code, _, err = self.forge(*NOVEL_ARGS, "--sample", "1", modes="commit,no_lookup")
+        self.assertEqual(code, 0, err)
+        self.assertIn("the forge undid the commit", err + _)
+        self.assertNotIn("the agent's own commit", self.commits())
+        self.assertIn("story/hero.md", self.prompt("extract-0001.repair1"))  # its new cards still need lookups
+
     def test_card_never_looked_up_stops_the_build(self):
         code, _, err = self.forge(*NOVEL_ARGS, modes="no_lookup,never_fix")
         self.assertEqual(code, 1)

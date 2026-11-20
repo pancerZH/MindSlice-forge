@@ -16,6 +16,9 @@ on request through the ``FAKE_MODES`` environment variable (comma-separated):
     probe_silent      the harness check is not answered
     probe_blind       the harness check is answered without the engine and without reading the source
     touch_reference   with --into, chunk 0001 also edits and adds cards in the copy of the existing workspace
+    touch_plan        chunk 0001 also edits slice.toml and starts a slice of its own
+    engine_write      chunk 0001 also writes a card with `mindslice write`, into the overlay
+    commit            chunk 0001 commits its work in the workspace's git repository
 
 With --into, the plan depends on every existing slice, and the hero card extends ``people/hero`` of the
 existing workspace when it has one.
@@ -146,9 +149,21 @@ def extract(ident: str, earlier_calls: int) -> None:
             card("story/broken", "Broken", "A card with a broken lineage.", extends="story/nowhere")
         if "warn_card" in MODES:
             (SLICE / "story" / "bare.md").write_text('+++\ntitle = "Bare"\n+++\n\n- no summary\n', encoding="utf-8")
+        if "touch_plan" in MODES:
+            with open(SLICE / "slice.toml", "a", encoding="utf-8") as fh:
+                fh.write('# changed by the session\n')
+            (OUT / "slices" / "extra.slice").mkdir()
+            (OUT / "slices" / "extra.slice" / "side.md").write_text('+++\ntitle = "Side"\n+++\n\nSide.\n', encoding="utf-8")
+        if "engine_write" in MODES:
+            subprocess.run(["mindslice", "-w", str(OUT), "write", "story/side", "--title", "Side", "--summary", "Side.",
+                            "--content", "- side", "--no-stage"], check=True, capture_output=True)
     card(f"story/hero-part-{ident}", f"Hero in part {ident}", content, extends="story/hero")
     note("ledger", ident)
     note("handoff", ident)
+    if "commit" in MODES and ident == "0001":
+        subprocess.run(["git", "-C", str(OUT), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(OUT), "-c", "user.name=a", "-c", "user.email=a@example.invalid", "commit", "-qm",
+                        "the agent's own commit"], check=True)
 
 
 def repair(step: str) -> None:
@@ -166,6 +181,8 @@ def repair(step: str) -> None:
     if step == "extract-0001":
         (SLICE / "story" / "broken.md").unlink(missing_ok=True)
         (SLICE / "story" / "bare.md").unlink(missing_ok=True)
+        (OUT / "slices" / "extra.slice" / "side.md").unlink(missing_ok=True)
+        (OUT / "overlay" / "story" / "side.md").unlink(missing_ok=True)
     if step == "finalize" and "finalize_card" in MODES:
         look_up("Glossary")
 

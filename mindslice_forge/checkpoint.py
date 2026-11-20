@@ -85,6 +85,21 @@ def restore(out: Path, name: str) -> list[str]:
     return changed
 
 
+def head(out: Path) -> str:
+    return git(out, "rev-parse", "HEAD").strip()
+
+
+def uncommit(out: Path, ref: str) -> None:
+    """Go back to the checkpoint ``ref``, keeping what later commits changed as uncommitted work."""
+    git(out, "reset", "-q", "--soft", ref)
+
+
+def live(out: Path) -> dict[Path, int]:
+    """The cards of live memory with their modification times: what the engine's writes would change."""
+    return {path.resolve(): path.stat().st_mtime_ns for name in ("overlay", "staging")
+            for path in (out / name).rglob("*.md")}
+
+
 def changed(out: Path) -> set[Path]:
     """Files created or modified since the last commit."""
     return _diff(out) | _untracked(out)

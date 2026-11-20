@@ -162,6 +162,13 @@ versa, ignoring case and respecting Latin word boundaries. A base name can cover
 Older steps and failed attempts do not count; edits to existing cards and slice overviews are
 exempt. Missing lookups are errors that stop the build if repairs cannot resolve them.
 
+**Extract and finalize sessions change only card files.** Anything else they change (`slice.toml`,
+`mounts.toml`, a file outside the planned slices) is restored from the last checkpoint and reported
+to a repair session; a new file outside the planned slices, or a card written into the overlay with
+`mindslice write`, is sent back to be moved into a card file of its slice. A commit a session makes
+in the workspace's repository is undone, keeping its changes, so the checks and a rollback still
+see them.
+
 Repairs must search the missing names, read matches, and merge duplicate cards into the one that
 already existed, preserving facts and updating links. This check verifies search coverage at the
 end of the step; deciding whether two cards describe the same thing remains the agent's job.

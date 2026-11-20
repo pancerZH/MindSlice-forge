@@ -31,6 +31,12 @@ SPLIT_NOT_NEEDED = "The sources fit in one session and will be read as a single 
 REFERENCE_CHANGED = ("this file is part of the copy of the existing workspace, which the build must not change, "
                      "and the forge has undone the change. If it added knowledge, put that in a card of your own "
                      "slice instead, one that extends or links to the existing card")
+OUTSIDE_CARDS = ("a step that writes cards changes only card files in the slices of the plan, and the forge has "
+                 "restored this file. Put what the change was for into a card instead")
+NEW_OUTSIDE = ("cards go only into the slices of the plan, as files: move what this file holds into a card file of the "
+               "slice it belongs to, then delete this file")
+ENGINE_WRITE = ("this card was written with `mindslice write` (or another engine command) and is not part of any slice: "
+                "put what it holds into a card file of the slice it belongs to, then delete this file")
 MAX_ISSUES_SHOWN = 50
 PROBE_TIMEOUT = 300  # seconds: the harness check is a task of a few tool calls
 
@@ -261,7 +267,7 @@ def extract(job: Job, state: dict, chunk: dict, position: str, previous: str | N
                     previous_handoff=handoff / f"{previous}.md" if previous else "(none: this is the first chunk)",
                     handoff_file=handoff / f"{chunk['id']}.md", ledger_file=job.work / "ledger" / f"{chunk['id']}.md",
                     existing=existing(job))
-    run_step(job, step, prompt, lambda: check_chunk(job, chunk), check_lookups=True)
+    run_step(job, step, prompt, lambda: check_chunk(job, chunk), cards=True)
     checkpoint.commit(job.out, f"chunk {chunk['id']}: {title}")
     state["chunks_done"].append(chunk["id"])
     state["finalized"] = False
@@ -297,7 +303,7 @@ def finalize(job: Job, state: dict, total: int) -> None:
                     report_file=job.work / "report.md", coverage=coverage,
                     profile_file=job.work / "profile.md", manifest_file=job.chunks / "manifest.json",
                     issues=format_issues(engine.issues(validate(job))) or "(none)", existing=existing(job))
-    run_step(job, "finalize", prompt, lambda: check_final(job), check_lookups=True)
+    run_step(job, "finalize", prompt, lambda: check_final(job), cards=True)
     checkpoint.commit(job.out, "finalize")
     state["finalized"] = True
     progress.save(job.state_file, state)
@@ -347,10 +353,12 @@ def connect(job: Job, state: dict, total: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_step(job: Job, step: str, prompt: str, check: Check, *, check_lookups: bool = False) -> None:
-    """Run the step's agent session, retrying from a clean workspace if it fails, then settle its result."""
+def run_step(job: Job, step: str, prompt: str, check: Check, *, cards: bool = False) -> None:
+    """Run the step's agent session, retrying from a clean workspace if it fails, then settle its result.
+    In a step that writes ``cards``, every new card needs a lookup, and only card files of the planned slices change."""
+    live = checkpoint.live(job.out)
     for delay in (*harness.BACKOFF, None):
-        earlier = len(lookup.queries(job.out)) if check_lookups else 0
+        earlier = len(lookup.queries(job.out)) if cards else 0
         if session(job, step, prompt):
             break
         checkpoint.rollback(job.out)
@@ -362,8 +370,8 @@ def run_step(job: Job, step: str, prompt: str, check: Check, *, check_lookups: b
 
     def checked() -> list[dict]:
         issues = check() + reference_changes(job)
-        if check_lookups:
-            issues += not_looked_up(job, lookup.queries(job.out)[earlier:])
+        if cards:
+            issues += not_looked_up(job, lookup.queries(job.out)[earlier:]) + outside_cards(job, live)
         return issues
 
     settle(job, step, checked, task=step)
@@ -396,7 +404,34 @@ def session(job: Job, name: str, prompt: str) -> bool:
     prompt_file.write_text(prompt, encoding="utf-8")
     cmd = harness.command(job.harness, prompt_file, job.work)
     checkpoint.begin(job.out)
-    return harness.run(cmd, job.work, job.work / "logs" / f"{name}.log", job.timeout)
+    head = checkpoint.head(job.out)
+    finished = harness.run(cmd, job.work, job.work / "logs" / f"{name}.log", job.timeout)
+    if checkpoint.head(job.out) != head:  # a commit would hide the session's work from the checks and the rollback
+        checkpoint.uncommit(job.out, head)
+        log(f"[{name}] the session committed in the workspace; the forge undid the commit and kept its changes")
+    return finished
+
+
+def outside_cards(job: Job, live: dict[Path, int]) -> list[dict]:
+    """What a card step changed besides card files of the planned slices. A file of the last checkpoint is restored;
+    a new file or a card written with the engine may hold the session's work, so the repair session moves it."""
+    out = job.out.resolve()
+    planned = [out / name for name in checkpoint.git(job.out, "ls-tree", "-z", "--name-only", "HEAD", "slices/").split("\0")
+               if name]
+    for directory in (out / "slices").glob("*.slice"):  # a slice of its own, emptied by a repair session
+        if directory not in planned and not any(path.is_file() for path in directory.rglob("*")):
+            shutil.rmtree(directory)
+    new, issues = checkpoint.created(job.out), []
+    for path in sorted(checkpoint.changed(job.out)):
+        if (path.suffix == ".md" and any(d in path.parents for d in planned)) or job.reference.resolve() in path.parents:
+            continue  # a card, or the copy of the existing workspace (see reference_changes)
+        if path in new:
+            issues.append(problem(NEW_OUTSIDE, path))
+        else:
+            checkpoint.restore(job.out, path.relative_to(out).as_posix())
+            issues.append(problem(OUTSIDE_CARDS, path))
+    return issues + [problem(ENGINE_WRITE, path) for path, mtime in sorted(checkpoint.live(job.out).items())
+                     if live.get(path) != mtime]
 
 
 def reference_changes(job: Job) -> list[dict]:
