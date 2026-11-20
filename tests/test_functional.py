@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from mindslice_forge import checkpoint, cli, harness, pipeline
+from mindslice_forge import ForgeError, checkpoint, cli, harness, pipeline
 
 FAKE = f"{sys.executable} {Path(__file__).with_name('fake_harness.py')} {{prompt_file}}"
 
@@ -445,6 +445,32 @@ class FunctionalTest(unittest.TestCase):
         self.assertEqual(self.calls(), [])
         self.assertFalse((target / "slices/demo-2.slice").exists())
 
+    def test_connect_resumes_after_the_second_mount_fails(self):
+        target = self.tmp / "target"
+        for ws in (self.out, target):
+            subprocess.run(["mindslice", "-w", str(ws), "init"], check=True, capture_output=True)
+        for alias in ("first", "second"):
+            source = self.out / "slices" / (alias + ".slice")
+            source.mkdir()
+            (source / "sample.md").write_text("Sample.")
+            pipeline.engine.mount(self.out, source, alias=alias)
+        job = pipeline.Job([], [], "", self.out, [], into=target)
+        job.work.mkdir()
+        state = {"chunks_done": ["one"]}
+        mount = pipeline.engine.mount
+
+        def flaky(ws, path, alias):
+            if alias == "@second":
+                raise OSError("interrupted")
+            return mount(ws, path, alias=alias)
+
+        with mock.patch.object(pipeline.engine, "mount", flaky), self.assertRaises(OSError):
+            pipeline.connect(job, state, 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            pipeline.connect(job, json.loads(job.state_file.read_text()), 1)
+        self.assertEqual({m["alias"] for m in pipeline.engine.mounts(target)}, {"@overlay", "@first", "@second"})
+        self.assertTrue(json.loads(job.state_file.read_text())["connected"])
+
     def test_sample_build_is_added_only_when_complete(self):
         target = self.target()
         code, out, err = self.forge(*NOVEL_ARGS, "--sample", "1", "--into", target)
@@ -614,6 +640,41 @@ class FunctionalTest(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("git"), "needs git")
 class LookupCheckpointTest(unittest.TestCase):
+    def test_interrupted_rollback_preserves_later_edits_and_git_excludes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            checkpoint.init(out)
+            exclude = out / ".git/info/exclude"
+            with exclude.open("a") as f:
+                f.write("/user-cache/\n")
+            checkpoint.commit(out, "baseline")
+            checkpoint.begin(out)
+            note = out / "notes.txt"
+            note.write_text("build output")
+            checkpoint.record_failed_attempt(out)
+            note.write_text("edited after interruption")
+            with self.assertRaises(ForgeError):
+                checkpoint.rollback(out)
+            self.assertEqual(note.read_text(), "edited after interruption")
+            self.assertIn("/user-cache/", exclude.read_text())
+
+    def test_ctrl_c_during_a_session_is_discarded_on_the_next_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            checkpoint.init(out)
+            checkpoint.commit(out, "baseline")
+            checkpoint.begin(out)
+            job = pipeline.Job(sources=[], dicts=[], prompt="", out=out, harness=[])
+
+            def interrupted(*args):
+                (out / "partial.md").write_text("half a card")
+                raise KeyboardInterrupt
+
+            with mock.patch.object(pipeline.harness, "run", interrupted), self.assertRaises(KeyboardInterrupt):
+                pipeline.run_harness(job, ["agent"], out / "log", 1)
+            checkpoint.rollback(out)
+            self.assertFalse((out / "partial.md").exists())
+
     def test_new_cards_include_staged_and_renamed_files_but_not_existing_edits(self):
         with tempfile.TemporaryDirectory(prefix="forge-checkpoint-") as directory:
             out = Path(directory).resolve()
@@ -643,7 +704,7 @@ class LookupCheckpointTest(unittest.TestCase):
             nested = card("topic/overview.md", "Topic overview")
 
             self.assertEqual(checkpoint.created(out), {renamed, staged, untracked, overview, nested})
-            self.assertEqual(checkpoint.changed(out), {old, renamed, staged, untracked, overview, nested})
+            self.assertEqual(checkpoint.changed(out), {old, original, deleted, renamed, staged, untracked, overview, nested})
             job = pipeline.Job(sources=[], dicts=[], prompt="", out=out, harness=[])
             issues = pipeline.not_looked_up(job, ["Storage"])
             self.assertEqual({Path(issue["file"]) for issue in issues}, {renamed, staged, nested})

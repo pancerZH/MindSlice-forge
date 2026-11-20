@@ -10,12 +10,14 @@ workspace holds, so that sessions find and link to it, and a complete build is t
 
 from __future__ import annotations
 
+import filecmp
 import json
 import re
 import secrets
 import shlex
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -315,6 +317,18 @@ def check_final(job: Job) -> list[dict]:
     return issues + engine.issues(validate(job))
 
 
+def same_copy(source: Path, copy: Path) -> bool:
+    """A reserved destination may have been filled or edited by someone else after interruption."""
+    if copy.is_symlink() or not copy.is_dir():
+        return False
+    diff = filecmp.dircmp(source, copy, ignore=[])
+    if diff.left_only or diff.right_only or diff.common_funny:
+        return False
+    return (all(not (copy / name).is_symlink() and filecmp.cmp(source / name, copy / name, shallow=False)
+                for name in diff.common_files)
+            and all(same_copy(source / name, copy / name) for name in diff.common_dirs))
+
+
 def connect(job: Job, state: dict, total: int) -> None:
     """--into: copy the slices of a complete build into the existing workspace and mount them there.
     An alias that is mounted there already is never replaced."""
@@ -325,7 +339,9 @@ def connect(job: Job, state: dict, total: int) -> None:
             "Run without --sample to finish the build, and it is added then.")
         return
     slices = built(job)
-    clash = sorted(set(slices) & {m["alias"] for m in engine.mounts(job.into)})
+    mounted = {m["alias"]: (job.into / m["path"]).resolve() for m in engine.mounts(job.into)}
+    destinations = state.setdefault("connecting", {})
+    clash = sorted(a for a in slices if a in mounted and str(mounted[a]) != destinations.get(a))
     if clash:
         raise ForgeError(f"{', '.join(clash)} is mounted in {job.into} already, and the forge does not replace a mount. "
                          f"If it is an earlier version of this build, unmount it (`mindslice -w {job.into} unmount "
@@ -334,10 +350,23 @@ def connect(job: Job, state: dict, total: int) -> None:
     copies = []
     for alias, mount in slices.items():
         source = (job.out / mount["path"]).resolve()
-        copies.append(copy := free_path(job.into / "slices", source.name))
-        shutil.copytree(source, copy)
-        engine.mount(job.into, copy)
+        if alias not in destinations:
+            destinations[alias] = str(free_path(job.into / "slices", source.name))
+            progress.save(job.state_file, state)
+        copy = Path(destinations[alias])
+        copies.append(copy)
+        if copy.exists() or copy.is_symlink():
+            if not same_copy(source, copy):
+                raise ForgeError(f"{copy} changed since this build reserved it; inspect the destination before resuming")
+        else:
+            with tempfile.TemporaryDirectory(dir=copy.parent, prefix=".forge-copy-") as temporary:
+                ready = Path(temporary) / "slice"
+                shutil.copytree(source, ready)
+                ready.rename(copy)
+        if alias not in mounted:
+            engine.mount(job.into, copy, alias=alias)
         log(f"  Added {alias} to {job.into}: {copy}")
+    del state["connecting"]
     state["connected"] = True
     progress.save(job.state_file, state)
     report = engine.validate(job.into)
@@ -361,6 +390,7 @@ def run_step(job: Job, step: str, prompt: str, check: Check, *, cards: bool = Fa
         earlier = len(lookup.queries(job.out)) if cards else 0
         if session(job, step, prompt):
             break
+        checkpoint.record_failed_attempt(job.out)
         checkpoint.rollback(job.out)
         if delay is None:
             raise ForgeError(f"{step}: the agent session failed {len(harness.BACKOFF) + 1} times; "
@@ -390,10 +420,20 @@ def settle(job: Job, step: str, check: Check, task: str) -> None:
                     render("repair", task_file=job.work / "prompts" / f"{task}.md", issues=format_issues(issues)))
     errors = [issue for issue in issues if issue["severity"] == "error"]
     if errors:
+        checkpoint.record_failed_attempt(job.out)
         raise ForgeError(f"{step}: problems remain after {job.max_repairs} repair session(s):\n{format_issues(errors)}\n"
                          f"The failed attempt is left in place for inspection; "
                          f"running the same command again discards it and retries this step.")
     log(f"[{step}] {len(issues)} warning(s) left for the final report")
+
+
+def run_harness(job: Job, cmd: list[str], log_file: Path, timeout: int) -> bool:
+    """harness.run; after Ctrl-C the session's files are recorded as its own, so a rerun discards them."""
+    try:
+        return harness.run(cmd, job.work, log_file, timeout)
+    except KeyboardInterrupt:
+        checkpoint.record_failed_attempt(job.out)
+        raise
 
 
 def session(job: Job, name: str, prompt: str) -> bool:
@@ -405,7 +445,7 @@ def session(job: Job, name: str, prompt: str) -> bool:
     cmd = harness.command(job.harness, prompt_file, job.work)
     checkpoint.begin(job.out)
     head = checkpoint.head(job.out)
-    finished = harness.run(cmd, job.work, job.work / "logs" / f"{name}.log", job.timeout)
+    finished = run_harness(job, cmd, job.work / "logs" / f"{name}.log", job.timeout)
     if checkpoint.head(job.out) != head:  # a commit would hide the session's work from the checks and the rollback
         checkpoint.uncommit(job.out, head)
         log(f"[{name}] the session committed in the workspace; the forge undid the commit and kept its changes")
@@ -430,8 +470,9 @@ def outside_cards(job: Job, live: dict[Path, int]) -> list[dict]:
         else:
             checkpoint.restore(job.out, path.relative_to(out).as_posix())
             issues.append(problem(OUTSIDE_CARDS, path))
-    return issues + [problem(ENGINE_WRITE, path) for path, mtime in sorted(checkpoint.live(job.out).items())
-                     if live.get(path) != mtime]
+    current = checkpoint.live(job.out)
+    return issues + [problem(ENGINE_WRITE, path) for path in sorted(live.keys() | current.keys())
+                     if live.get(path) != current.get(path)]
 
 
 def reference_changes(job: Job) -> list[dict]:
@@ -459,11 +500,11 @@ def check_harness(job: Job) -> None:
     cmd = harness.command(job.harness, prompt_file, job.work)
     timeout = min(job.timeout, PROBE_TIMEOUT)
     checkpoint.begin(job.out)
-    try:  # no step is unfinished when a run reaches its first session, so the rollback only removes the answer
-        finished = harness.run(cmd, job.work, log_file, timeout)
-        answer = answer_file.read_text(encoding="utf-8", errors="replace") if answer_file.is_file() else None
-    finally:
-        checkpoint.rollback(job.out)
+    finished = run_harness(job, cmd, log_file, timeout)
+    answer = answer_file.read_text(encoding="utf-8", errors="replace") if answer_file.is_file() else None
+    if checkpoint.changed(job.out) <= {answer_file}:
+        checkpoint.record_failed_attempt(job.out)
+    checkpoint.rollback(job.out)
 
     problems = []
     if not finished:

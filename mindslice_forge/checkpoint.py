@@ -11,6 +11,8 @@ the user bakes or mounts; a rollback that would remove such a change is refused.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import subprocess
 from pathlib import Path
 
@@ -21,6 +23,7 @@ OPTIONS = ["-c", "user.name=mindslice-forge", "-c", "user.email=forge@localhost"
 WORKSPACE_DIRS = ("overlay", "staging", "slices")  # empty ones are not tracked by git
 LIVE = ("overlay", "staging", ".history")  # written by the engine while the workspace is in use as memory
 PENDING = "forge-pending"  # in .git, from the start of an agent session until the next checkpoint
+RUNNING = "running\n"  # its content while the session runs; a failed attempt replaces it with a fingerprint
 
 
 def git(out: Path, *args: str) -> str:
@@ -40,9 +43,32 @@ def init(out: Path) -> None:
 
 
 def begin(out: Path) -> None:
-    """An agent session is about to work in ``out``: until the next checkpoint, what differs from
-    the last one is the forge's own unfinished work, and a rollback may discard it."""
-    (out / ".git" / PENDING).touch()
+    """Mark the session as running. A hard interruption leaves its dirty files for inspection."""
+    (out / ".git" / PENDING).write_text(RUNNING, encoding="ascii")
+
+
+def _fingerprint(out: Path) -> str:
+    digest = hashlib.sha256()
+    for args in (("diff", "--cached"), ("diff",)):
+        digest.update(git(out, *args, "--binary", "--no-ext-diff", "--").encode())
+    for name in git(out, "ls-files", "--others", "--exclude-standard", "-z").split("\0"):
+        if not name:
+            continue
+        path = out / name
+        digest.update(os.fsencode(name) + b"\0")
+        digest.update(str(path.lstat().st_mode).encode() + b"\0")
+        if path.is_symlink():
+            digest.update(os.fsencode(os.readlink(path)))
+        elif path.is_file():
+            with path.open("rb") as stream:
+                digest.update(hashlib.file_digest(stream, "sha256").digest())
+        else:
+            raise ForgeError(f"cannot checkpoint special file {path}; preserve it before resuming")
+    return digest.hexdigest()
+
+
+def record_failed_attempt(out: Path) -> None:
+    (out / ".git" / PENDING).write_text(_fingerprint(out), encoding="ascii")
 
 
 def commit(out: Path, message: str, tag: str | None = None) -> None:
@@ -62,12 +88,18 @@ def rollback(out: Path, ref: str = "HEAD") -> None:
         raise ForgeError(f"{out} has no forge checkpoints (its .git is missing); choose another --output")
     _exclude_live(out)  # also for a workspace that an earlier forge version created
     pending = out / ".git" / PENDING
-    foreign = [] if pending.exists() else git(out, "status", "--porcelain").splitlines()
+    foreign = git(out, "status", "--porcelain").splitlines()
+    if foreign and pending.exists() and pending.read_text(encoding="ascii") == _fingerprint(out):
+        foreign = []
     if foreign:
-        raise ForgeError(f"{out} has changes that the forge did not make:\n"
+        interrupted = pending.exists() and pending.read_text(encoding="ascii") == RUNNING
+        raise ForgeError(f"{out} has changes that the forge did not make or cannot identify after an interruption:\n"
                          + "\n".join(f"  {line}" for line in foreign)
                          + "\nContinuing this build would discard them. Undo them, or build into another "
-                           "--output and mount its slices where they are needed.")
+                           "--output and mount its slices where they are needed."
+                         + (f"\nAn agent session was killed before it ended. If these are its leftovers, discard them "
+                            f"with `git -C {out} reset --hard && git -C {out} clean -fd` and run again."
+                            if interrupted else ""))
     git(out, "reset", "-q", "--hard", ref)
     git(out, "clean", "-fdq")
     pending.unlink(missing_ok=True)
@@ -124,8 +156,15 @@ def _exclude_live(out: Path) -> None:
     """Keep live memory out of every commit, comparison and rollback."""
     info = out / ".git" / "info"
     info.mkdir(exist_ok=True)
-    (info / "exclude").write_text("".join(f"/{name}/\n" for name in LIVE), encoding="utf-8")
+    exclude = info / "exclude"
+    old = exclude.read_bytes() if exclude.exists() else b""
+    missing = [f"/{name}/".encode() for name in LIVE if f"/{name}/".encode() not in old.splitlines()]
+    if missing:
+        with exclude.open("ab") as stream:
+            if old and not old.endswith(b"\n"):
+                stream.write(b"\n")
+            stream.write(b"\n".join(missing) + b"\n")
 
 
 def _paths(out: Path, names: str) -> set[Path]:
-    return {path for name in names.split("\0") if name and (path := (out / name).resolve()).is_file()}
+    return {out / name for name in names.split("\0") if name}

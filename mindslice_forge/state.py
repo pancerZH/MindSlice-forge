@@ -45,3 +45,4 @@ def rewind(state: dict, stage: str) -> None:
         state["chunks_done"] = []
     state["finalized"] = False
     state["connected"] = False
+    state.pop("connecting", None)
